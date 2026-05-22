@@ -1,0 +1,24 @@
+[package]
+name = "zhi-gtk"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "xie-code"
+path = "src/main.rs"
+
+[dependencies]
+zhi-core = { workspace = true }
+
+relm4 = { workspace = true }
+# Activa los widgets de libadwaita ≥1.2.
+# Es la misma crate que `relm4::adw` reexporta; cargo unifica las features.
+libadwaita = { version = "0.7", features = ["v1_2"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+pulldown-cmark = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

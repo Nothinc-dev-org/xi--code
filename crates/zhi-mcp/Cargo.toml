@@ -1,0 +1,11 @@
+[package]
+name = "zhi-mcp"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

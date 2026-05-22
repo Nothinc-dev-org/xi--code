@@ -1,0 +1,19 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Scratch local de desarrollo
+/HolaMundo
+/HolaMundo.rs
+
+# Bases de datos locales de desarrollo
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Entorno
+.env
+.env.local
+.env.*.local

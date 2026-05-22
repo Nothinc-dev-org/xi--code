@@ -1,0 +1,14 @@
+[package]
+name = "zhi-provider"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,22 @@
+[package]
+name = "zhi-core"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+zhi-provider = { workspace = true }
+zhi-tool = { workspace = true }
+zhi-mcp = { workspace = true }
+zhi-lsp = { workspace = true }
+
+tokio = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+async-channel = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

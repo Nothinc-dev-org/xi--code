@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.82"
+
+[workspace.dependencies]
+# Async runtime e I/O
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "process",
+    "fs",
+    "io-util",
+    "time",
+] }
+futures = "0.3"
+async-stream = "0.3"
+async-channel = "2"
+async-trait = "0.1"
+
+# Sistema de archivos / búsqueda (tools)
+walkdir = "2"
+glob = "0.3"
+regex = "1"
+
+# Markdown
+pulldown-cmark = { version = "0.12", default-features = false }
+
+# Serialización
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errores y logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP / LLM
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+] }
+
+# Persistencia
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros"] }
+
+# UI
+relm4 = { version = "0.9", features = ["libadwaita"] }
+
+# Crates internos
+zhi-core = { path = "crates/zhi-core" }
+zhi-provider = { path = "crates/zhi-provider" }
+zhi-tool = { path = "crates/zhi-tool" }
+zhi-mcp = { path = "crates/zhi-mcp" }
+zhi-lsp = { path = "crates/zhi-lsp" }
