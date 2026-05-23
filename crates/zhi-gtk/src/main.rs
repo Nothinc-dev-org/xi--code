@@ -10,6 +10,7 @@
 mod markdown;
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -19,7 +20,7 @@ use relm4::adw::prelude::*;
 use relm4::{adw, gtk, Component, ComponentParts, ComponentSender, RelmApp, RelmWidgetExt};
 use zhi_core::{
     AgentEvent, Engine, Message, PermissionDecision, PermissionRequest, PermissionResolver, Role,
-    Session, SessionMeta, Store, ToolContext,
+    Session, SessionMeta, Snapshots, Store, ToolContext,
 };
 
 const APP_ID: &str = "ai.xiecode.App";
@@ -31,6 +32,9 @@ struct App {
     engine: Option<Engine>,
     /// `None` si no se pudo abrir la base de datos.
     store: Option<Store>,
+    /// Snapshots del worktree (Fase 3c). `None` hasta `SnapshotsReady`, o
+    /// permanente si `git` no está disponible.
+    snapshots: Option<Snapshots>,
     /// Directorio de trabajo del proyecto activo (worktree de las tools).
     workdir: PathBuf,
     /// Proyecto activo (directorio de trabajo); se resuelve en el arranque.
@@ -45,6 +49,22 @@ struct App {
     streaming_label: Option<gtk::Label>,
     /// Label de salida de la tarjeta de tool en ejecución.
     tool_output: Option<gtk::Label>,
+    /// Tarjeta de tool en ejecución (para colgar de ella el botón "Revertir"
+    /// al cerrar el paso).
+    tool_card: Option<gtk::Box>,
+    /// Tarjeta del paso ya cerrado que está esperando el `message_id` del
+    /// snapshot recién persistido para colgarle el botón "Revertir". Vive solo
+    /// entre `TurnFinished` y `SnapshotPersisted`; sobrevive a un `Send` que
+    /// llegue en medio (sin esto, el reset de `tool_card` por el siguiente
+    /// turno se llevaría por delante el botón).
+    revertible_card: Option<gtk::Box>,
+    /// Snapshot tomado para el paso actual del agente: `(hash, message_index)`,
+    /// donde `message_index` apunta al mensaje del asistente del paso dentro
+    /// del `Vec<Message>` que llegará en `TurnFinished`.
+    pending_snapshot: Option<(String, usize)>,
+    /// `message_id` (DB) → `hash`. Repoblado al cargar una sesión y extendido
+    /// tras cada turno.
+    message_snapshots: HashMap<i64, String>,
     /// Texto acumulado del segmento de texto en curso (markdown sin renderizar).
     partial: String,
     busy: bool,
@@ -57,10 +77,15 @@ enum Msg {
         project_id: i64,
         sessions: Vec<SessionMeta>,
     },
+    /// El manager de snapshots terminó de abrirse (puede no estar disponible).
+    SnapshotsReady(Snapshots),
     /// El usuario seleccionó la fila `index` del sidebar.
     SelectIndex(i32),
-    /// Llegó el historial de la sesión seleccionada.
-    SessionLoaded(Vec<Message>),
+    /// Llegó el historial de la sesión seleccionada con sus snapshots.
+    SessionLoaded {
+        messages: Vec<(i64, Message)>,
+        snapshots: HashMap<i64, String>,
+    },
     /// Crear una sesión nueva.
     NewSession,
     /// Se creó una sesión nueva.
@@ -71,6 +96,11 @@ enum Msg {
     Send(String),
     /// Llega un fragmento de texto del asistente.
     Delta(String),
+    /// El motor capturó un snapshot del worktree para el paso actual.
+    StepSnapshot { hash: String, message_index: usize },
+    /// El snapshot del último turno ya está persistido bajo `message_id`;
+    /// listo para colgar el botón "Revertir" de la última tarjeta del paso.
+    SnapshotPersisted { message_id: i64, hash: String },
     /// El agente va a ejecutar una tool.
     ToolStarted { name: String, arguments: String },
     /// Una tool terminó con su salida.
@@ -82,6 +112,12 @@ enum Msg {
     },
     /// El turno terminó: mensajes producidos para persistir y extender la sesión.
     TurnFinished(Vec<Message>),
+    /// El usuario pidió revertir el snapshot asociado al mensaje `message_id`.
+    Revert(i64),
+    /// Llegó la lista de archivos que cambiarán al revertir; pedir confirmación.
+    RevertPreview { hash: String, files: Vec<PathBuf> },
+    /// La restauración terminó: recargar la sesión activa.
+    RevertDone,
     /// El turno falló.
     Failed(String),
 }
@@ -241,6 +277,7 @@ impl Component for App {
         let model = App {
             engine: Engine::from_env().ok(),
             store: store.clone(),
+            snapshots: None,
             workdir: workdir.clone(),
             project_id: None,
             sessions: Vec::new(),
@@ -248,6 +285,10 @@ impl Component for App {
             session: Session::new(),
             streaming_label: None,
             tool_output: None,
+            tool_card: None,
+            revertible_card: None,
+            pending_snapshot: None,
+            message_snapshots: HashMap::new(),
             partial: String::new(),
             busy: false,
         };
@@ -294,7 +335,7 @@ impl Component for App {
         widgets: &mut Self::Widgets,
         message: Self::Input,
         sender: ComponentSender<Self>,
-        _root: &Self::Root,
+        root: &Self::Root,
     ) {
         let was_busy = self.busy;
 
@@ -310,6 +351,25 @@ impl Component for App {
                 } else {
                     rebuild_session_list(&widgets.session_list, &self.sessions, 0);
                 }
+
+                // Inicializa el manager de snapshots para este proyecto. El
+                // shadow vive en `$XDG_DATA_HOME/xiě-code/snapshots/<id>`.
+                let workdir = self.workdir.clone();
+                let git_dir = snapshots_dir(project_id);
+                let sender = sender.clone();
+                relm4::spawn(async move {
+                    match Snapshots::open(workdir, git_dir).await {
+                        Ok(snap) => sender.input(Msg::SnapshotsReady(snap)),
+                        Err(err) => tracing::warn!(%err, "no se pudo abrir snapshots"),
+                    }
+                });
+            }
+
+            Msg::SnapshotsReady(snap) => {
+                if !snap.available() {
+                    tracing::warn!("snapshots deshabilitados: el botón «Revertir» no aparecerá");
+                }
+                self.snapshots = Some(snap);
             }
 
             Msg::SelectIndex(index) => {
@@ -326,24 +386,41 @@ impl Component for App {
                 self.current_session = Some(id);
                 self.streaming_label = None;
                 self.tool_output = None;
+                self.tool_card = None;
+                self.revertible_card = None;
+                self.pending_snapshot = None;
+                self.message_snapshots.clear();
                 self.partial.clear();
                 clear_chat(&widgets.chat_list);
 
                 if let Some(store) = self.store.clone() {
                     let sender = sender.clone();
                     relm4::spawn(async move {
-                        match store.load_messages(id).await {
-                            Ok(messages) => sender.input(Msg::SessionLoaded(messages)),
-                            Err(err) => sender.input(Msg::Failed(err.to_string())),
-                        }
+                        let messages = match store.load_messages(id).await {
+                            Ok(m) => m,
+                            Err(err) => {
+                                sender.input(Msg::Failed(err.to_string()));
+                                return;
+                            }
+                        };
+                        let snapshots = store.load_snapshots(id).await.unwrap_or_default();
+                        sender.input(Msg::SessionLoaded {
+                            messages,
+                            snapshots,
+                        });
                     });
                 }
             }
 
-            Msg::SessionLoaded(messages) => {
+            Msg::SessionLoaded {
+                messages,
+                snapshots,
+            } => {
                 clear_chat(&widgets.chat_list);
-                render_history(&widgets.chat_list, &messages);
-                self.session = Session::from_messages(messages);
+                render_history(&widgets.chat_list, &messages, &snapshots, &sender);
+                self.message_snapshots = snapshots;
+                self.session =
+                    Session::from_messages(messages.into_iter().map(|(_, m)| m).collect());
             }
 
             Msg::NewSession => {
@@ -426,6 +503,8 @@ impl Component for App {
 
                 self.streaming_label = None;
                 self.tool_output = None;
+                self.tool_card = None;
+                self.pending_snapshot = None;
                 self.partial.clear();
                 self.busy = true;
 
@@ -436,12 +515,20 @@ impl Component for App {
                     sender: sender.clone(),
                 });
                 let history = self.session.history();
+                let snapshots = self.snapshots.clone();
                 let sender = sender.clone();
                 relm4::spawn(async move {
-                    let mut stream = engine.run_turn(history, ctx, resolver);
+                    let mut stream = engine.run_turn(history, ctx, snapshots, resolver);
                     while let Some(event) = stream.next().await {
                         match event {
                             Ok(AgentEvent::Delta(d)) => sender.input(Msg::Delta(d)),
+                            Ok(AgentEvent::StepSnapshot {
+                                hash,
+                                message_index,
+                            }) => sender.input(Msg::StepSnapshot {
+                                hash,
+                                message_index,
+                            }),
                             Ok(AgentEvent::ToolStarted { name, arguments }) => {
                                 sender.input(Msg::ToolStarted { name, arguments })
                             }
@@ -477,8 +564,17 @@ impl Component for App {
                     }
                 }
                 self.partial.clear();
-                let output = append_tool_card(&widgets.chat_list, &name, &arguments, "Ejecutando…");
+                let (card, output) =
+                    append_tool_card(&widgets.chat_list, &name, &arguments, "Ejecutando…");
                 self.tool_output = Some(output);
+                self.tool_card = Some(card);
+            }
+
+            Msg::StepSnapshot {
+                hash,
+                message_index,
+            } => {
+                self.pending_snapshot = Some((hash, message_index));
             }
 
             Msg::ToolFinished { output, ok } => {
@@ -500,18 +596,119 @@ impl Component for App {
                 }
                 self.partial.clear();
                 self.tool_output = None;
+                let pending = self.pending_snapshot.take();
+                // Mover la card a `revertible_card` para que sobreviva a un
+                // posible `Send` que llegue antes de `SnapshotPersisted`.
+                if pending.is_some() {
+                    self.revertible_card = self.tool_card.take();
+                }
                 self.busy = false;
                 self.session.extend(messages.clone());
 
                 if let (Some(store), Some(session_id)) = (self.store.clone(), self.current_session)
                 {
+                    let sender = sender.clone();
                     relm4::spawn(async move {
+                        let mut ids: Vec<i64> = Vec::with_capacity(messages.len());
                         for msg in &messages {
-                            if let Err(err) = store.append_message(session_id, msg).await {
-                                tracing::error!(%err, "no se pudo guardar un mensaje del turno");
+                            match store.append_message(session_id, msg).await {
+                                Ok(id) => ids.push(id),
+                                Err(err) => {
+                                    tracing::error!(%err, "no se pudo guardar un mensaje del turno");
+                                    return;
+                                }
+                            }
+                        }
+                        if let Some((hash, idx)) = pending {
+                            if let Some(&message_id) = ids.get(idx) {
+                                if let Err(err) =
+                                    store.set_message_snapshot(message_id, &hash).await
+                                {
+                                    tracing::warn!(%err, "no se pudo persistir el snapshot");
+                                    return;
+                                }
+                                sender.input(Msg::SnapshotPersisted { message_id, hash });
                             }
                         }
                     });
+                }
+            }
+
+            Msg::SnapshotPersisted { message_id, hash } => {
+                self.message_snapshots.insert(message_id, hash);
+                let card = self
+                    .revertible_card
+                    .take()
+                    .or_else(|| self.tool_card.take());
+                match card {
+                    Some(card) if card.parent().is_some() => {
+                        attach_revert_button(&card, message_id, &sender);
+                    }
+                    Some(_) => {
+                        // La tarjeta fue desligada (sesión recargada o
+                        // cambiada): pinta el botón como una fila propia al
+                        // final del chat para no perder la acción.
+                        attach_revert_button(&widgets.chat_list, message_id, &sender);
+                    }
+                    None => {
+                        // No había card del paso (caso raro); cuelga el botón
+                        // al final del chat para que el usuario lo encuentre.
+                        attach_revert_button(&widgets.chat_list, message_id, &sender);
+                    }
+                }
+            }
+
+            Msg::Revert(message_id) => {
+                if self.busy {
+                    return;
+                }
+                let (Some(snap), Some(hash)) = (
+                    self.snapshots.clone(),
+                    self.message_snapshots.get(&message_id).cloned(),
+                ) else {
+                    return;
+                };
+                let sender = sender.clone();
+                relm4::spawn(async move {
+                    match snap.patch_files(&hash).await {
+                        Ok(files) => sender.input(Msg::RevertPreview { hash, files }),
+                        Err(err) => sender.input(Msg::Failed(err.to_string())),
+                    }
+                });
+            }
+
+            Msg::RevertPreview { hash, files } => {
+                let Some(snap) = self.snapshots.clone() else {
+                    return;
+                };
+                let files_for_restore = files.clone();
+                let sender_dialog = sender.clone();
+                show_revert_dialog(root, &files, move |confirmed| {
+                    if !confirmed {
+                        return;
+                    }
+                    let snap = snap.clone();
+                    let hash = hash.clone();
+                    let files = files_for_restore.clone();
+                    let sender = sender_dialog.clone();
+                    relm4::spawn(async move {
+                        match snap.restore(&hash, &files).await {
+                            Ok(()) => sender.input(Msg::RevertDone),
+                            Err(err) => sender.input(Msg::Failed(err.to_string())),
+                        }
+                    });
+                });
+            }
+
+            Msg::RevertDone => {
+                // Recarga la sesión activa: el chat ya refleja la conversación
+                // como estaba; el cambio visible está en el FS del worktree.
+                if let Some(id) = self.current_session {
+                    if let Some(idx) = self.sessions.iter().position(|m| m.id == id) {
+                        // Forzamos recarga.
+                        self.current_session = None;
+                        sender.input(Msg::SelectIndex(idx as i32));
+                    }
                 }
             }
 
@@ -522,6 +719,7 @@ impl Component for App {
                     append_bubble(&widgets.chat_list, Role::System, &format!("Error: {err}"));
                 }
                 self.tool_output = None;
+                self.tool_card = None;
                 self.partial.clear();
                 self.busy = false;
             }
@@ -591,16 +789,21 @@ fn clear_chat(chat_list: &gtk::Box) {
 }
 
 /// Renderiza un historial cargado: burbujas de texto y tarjetas de tool con su
-/// salida (los resultados `Role::Tool` se fusionan en la tarjeta por id).
-fn render_history(chat_list: &gtk::Box, messages: &[Message]) {
-    use std::collections::HashMap;
+/// salida (los resultados `Role::Tool` se fusionan en la tarjeta por id). Los
+/// mensajes con snapshot reciben un botón "Revertir" en su última tarjeta.
+fn render_history(
+    chat_list: &gtk::Box,
+    messages: &[(i64, Message)],
+    snapshots: &HashMap<i64, String>,
+    sender: &ComponentSender<App>,
+) {
     let outputs: HashMap<&str, &str> = messages
         .iter()
-        .filter(|m| m.role == Role::Tool)
-        .filter_map(|m| m.tool_call_id.as_deref().map(|id| (id, m.content.as_str())))
+        .filter(|(_, m)| m.role == Role::Tool)
+        .filter_map(|(_, m)| m.tool_call_id.as_deref().map(|id| (id, m.content.as_str())))
         .collect();
 
-    for message in messages {
+    for (message_id, message) in messages {
         match message.role {
             Role::User | Role::System => {
                 append_bubble(chat_list, message.role, &message.content);
@@ -610,20 +813,43 @@ fn render_history(chat_list: &gtk::Box, messages: &[Message]) {
                     let label = append_bubble(chat_list, Role::Assistant, &message.content);
                     label.set_markup(&markdown::to_pango(&message.content));
                 }
+                let mut last_card: Option<gtk::Box> = None;
                 for call in &message.tool_calls {
                     let output = outputs.get(call.id.as_str()).copied().unwrap_or("");
-                    let label = append_tool_card(
+                    let (card, label) = append_tool_card(
                         chat_list,
                         &call.function.name,
                         &call.function.arguments,
                         output,
                     );
                     set_tool_output(&label, output, true);
+                    last_card = Some(card);
+                }
+                if snapshots.contains_key(message_id) {
+                    if let Some(card) = last_card {
+                        attach_revert_button(&card, *message_id, sender);
+                    }
                 }
             }
             Role::Tool => {} // ya fusionado en la tarjeta de la llamada
         }
     }
+}
+
+/// Ubicación del shadow git de un proyecto. Vive bajo el directorio de datos
+/// XDG, separado por `project_id` para que las sesiones del mismo worktree
+/// compartan objetos.
+fn snapshots_dir(project_id: i64) -> PathBuf {
+    let base = match std::env::var_os("XDG_DATA_HOME") {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => {
+            let home = std::env::var_os("HOME").unwrap_or_default();
+            PathBuf::from(home).join(".local/share")
+        }
+    };
+    base.join("xiě-code")
+        .join("snapshots")
+        .join(project_id.to_string())
 }
 
 /// Añade una burbuja de mensaje al chat y devuelve el label de su contenido (para
@@ -650,8 +876,14 @@ fn append_bubble(chat_list: &gtk::Box, role: Role, content: &str) -> gtk::Label 
     body
 }
 
-/// Añade una tarjeta de ejecución de tool y devuelve el label de su salida.
-fn append_tool_card(chat_list: &gtk::Box, name: &str, args: &str, initial: &str) -> gtk::Label {
+/// Añade una tarjeta de ejecución de tool y devuelve la tarjeta y el label de
+/// su salida. La tarjeta se devuelve para colgarle después un botón "Revertir".
+fn append_tool_card(
+    chat_list: &gtk::Box,
+    name: &str,
+    args: &str,
+    initial: &str,
+) -> (gtk::Box, gtk::Label) {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 4);
     card.add_css_class("card");
     card.set_margin_all(4);
@@ -692,7 +924,62 @@ fn append_tool_card(chat_list: &gtk::Box, name: &str, args: &str, initial: &str)
     card.append(&output);
     chat_list.append(&card);
 
-    output
+    (card, output)
+}
+
+/// Cuelga un botón "Revertir" al final de la tarjeta de tool. Al pulsarlo, envía
+/// `Msg::Revert(message_id)`; el handler abre el diálogo de confirmación.
+fn attach_revert_button(card: &gtk::Box, message_id: i64, sender: &ComponentSender<App>) {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    row.set_halign(gtk::Align::End);
+    row.set_margin_all(8);
+
+    let button = gtk::Button::with_label("Revertir");
+    button.add_css_class("flat");
+    let sender = sender.clone();
+    button.connect_clicked(move |_| sender.input(Msg::Revert(message_id)));
+
+    row.append(&button);
+    card.append(&row);
+}
+
+/// Muestra un `adw::MessageDialog` listando los archivos que cambiarán y, si el
+/// usuario confirma, invoca `on_response(true)`. `MessageDialog` está disponible
+/// desde libadwaita 1.2 (en 1.5 lo reemplaza `AlertDialog`; migrar cuando se
+/// suba la feature en Fase 6, junto con `NavigationSplitView`).
+fn show_revert_dialog(
+    parent: &adw::ApplicationWindow,
+    files: &[PathBuf],
+    on_response: impl Fn(bool) + 'static,
+) {
+    let body = if files.is_empty() {
+        "El worktree coincide con el snapshot; no hay archivos que cambiar.".to_string()
+    } else {
+        let list = files
+            .iter()
+            .take(20)
+            .map(|p| format!("• {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let extra = files.len().saturating_sub(20);
+        if extra == 0 {
+            format!("Se sobrescribirán los siguientes archivos:\n\n{list}")
+        } else {
+            format!("Se sobrescribirán los siguientes archivos:\n\n{list}\n… y {extra} más")
+        }
+    };
+
+    let dialog = adw::MessageDialog::new(Some(parent), Some("Revertir cambios"), Some(&body));
+    dialog.add_response("cancel", "Cancelar");
+    dialog.add_response("revert", "Revertir");
+    dialog.set_response_appearance("revert", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    dialog.connect_response(None, move |_dialog, response| {
+        on_response(response == "revert");
+    });
+    dialog.present();
 }
 
 fn append_permission_controls(

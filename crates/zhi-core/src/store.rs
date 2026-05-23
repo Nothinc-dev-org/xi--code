@@ -7,6 +7,7 @@
 //! Ubicación de la base de datos: directorio de datos XDG del usuario
 //! (`$XDG_DATA_HOME/xiě-code` o `~/.local/share/xiě-code`).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -88,6 +89,9 @@ impl Store {
         // para no depender de un sistema de migraciones. Ver ADR-0007.
         self.ensure_column("messages", "tool_calls").await?;
         self.ensure_column("messages", "tool_call_id").await?;
+        // Hash del snapshot (Fase 3c): se asocia al mensaje del asistente que
+        // contiene las `tool_calls` del paso. Ver ADR-0007.
+        self.ensure_column("messages", "snapshot").await?;
         Ok(())
     }
 
@@ -164,26 +168,35 @@ impl Store {
         Ok(())
     }
 
-    /// Carga el historial de mensajes de una sesión, en orden cronológico.
-    pub async fn load_messages(&self, session_id: i64) -> crate::Result<Vec<Message>> {
+    /// Carga el historial de mensajes de una sesión, en orden cronológico,
+    /// emparejado con el id de cada fila (la UI lo usa para asociar snapshots
+    /// y otros metadatos al mensaje correspondiente).
+    pub async fn load_messages(&self, session_id: i64) -> crate::Result<Vec<(i64, Message)>> {
         let rows = sqlx::query_as::<_, StoredMessage>(
-            "SELECT role, content, tool_calls, tool_call_id
+            "SELECT id, role, content, tool_calls, tool_call_id
              FROM messages WHERE session_id = ? ORDER BY id ASC",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(StoredMessage::into_message).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let id = row.id;
+                (id, row.into_message())
+            })
+            .collect())
     }
 
-    /// Añade un mensaje (con sus *parts*) a una sesión y refresca `updated_at`.
-    pub async fn append_message(&self, session_id: i64, message: &Message) -> crate::Result<()> {
+    /// Añade un mensaje (con sus *parts*) a una sesión, refresca `updated_at`
+    /// y devuelve el id del mensaje insertado (para asociarle un snapshot).
+    pub async fn append_message(&self, session_id: i64, message: &Message) -> crate::Result<i64> {
         let tool_calls = if message.tool_calls.is_empty() {
             None
         } else {
             Some(serde_json::to_string(&message.tool_calls).unwrap_or_default())
         };
-        sqlx::query(
+        let id = sqlx::query(
             "INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id)
              VALUES (?, ?, ?, ?, ?)",
         )
@@ -193,18 +206,43 @@ impl Store {
         .bind(tool_calls)
         .bind(&message.tool_call_id)
         .execute(&self.pool)
-        .await?;
+        .await?
+        .last_insert_rowid();
         sqlx::query("UPDATE sessions SET updated_at = datetime('now') WHERE id = ?")
             .bind(session_id)
             .execute(&self.pool)
             .await?;
+        Ok(id)
+    }
+
+    /// Asocia un hash de snapshot al mensaje `message_id` (Fase 3c).
+    pub async fn set_message_snapshot(&self, message_id: i64, hash: &str) -> crate::Result<()> {
+        sqlx::query("UPDATE messages SET snapshot = ? WHERE id = ?")
+            .bind(hash)
+            .bind(message_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
+    }
+
+    /// Mapa `message_id → snapshot_hash` para los mensajes de una sesión.
+    /// La UI lo usa para repoblar los botones de revertir al cargar historial.
+    pub async fn load_snapshots(&self, session_id: i64) -> crate::Result<HashMap<i64, String>> {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, snapshot FROM messages
+             WHERE session_id = ? AND snapshot IS NOT NULL",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
     }
 }
 
 /// Fila cruda de `messages` antes de mapearse al tipo de dominio.
 #[derive(sqlx::FromRow)]
 struct StoredMessage {
+    id: i64,
     role: String,
     content: String,
     tool_calls: Option<String>,
@@ -289,11 +327,18 @@ mod tests {
             .append_message(session.id, &Message::user("hola"))
             .await
             .unwrap();
-        store
+        let assistant_id = store
             .append_message(session.id, &Message::assistant("¡hola!"))
             .await
             .unwrap();
         store.rename_session(session.id, "Saludo").await.unwrap();
+
+        store
+            .set_message_snapshot(assistant_id, "abc123")
+            .await
+            .unwrap();
+        let snaps = store.load_snapshots(session.id).await.unwrap();
+        assert_eq!(snaps.get(&assistant_id).map(String::as_str), Some("abc123"));
 
         let sessions = store.list_sessions(project).await.unwrap();
         assert_eq!(sessions.len(), 1);
@@ -301,9 +346,10 @@ mod tests {
 
         let messages = store.load_messages(session.id).await.unwrap();
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, Role::User);
-        assert_eq!(messages[0].content, "hola");
-        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(messages[0].1.role, Role::User);
+        assert_eq!(messages[0].1.content, "hola");
+        assert_eq!(messages[1].1.role, Role::Assistant);
+        assert_eq!(messages[1].0, assistant_id);
 
         let _ = std::fs::remove_file(&path);
     }

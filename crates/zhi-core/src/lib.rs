@@ -10,6 +10,7 @@
 //! reinyecta sus resultados y resuelve permisos vía un [`PermissionResolver`].
 //! Ver [ADR-0007](../../docs/decisions/0007-tools-permisos-bucle-agente.md).
 
+pub mod snapshot;
 pub mod store;
 
 use std::pin::Pin;
@@ -19,6 +20,7 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 
+pub use snapshot::Snapshots;
 pub use store::{SessionMeta, Store};
 pub use zhi_provider::{EventStream, Message, Role, StreamEvent, ToolCall};
 pub use zhi_tool::{ToolContext, ToolRegistry};
@@ -36,6 +38,8 @@ pub enum Error {
     Lsp(#[from] zhi_lsp::Error),
     #[error("error de persistencia: {0}")]
     Storage(#[from] sqlx::Error),
+    #[error("error de snapshot: {0}")]
+    Snapshot(String),
     #[error("falta la variable de entorno DEEPSEEK_API_KEY")]
     MissingApiKey,
 }
@@ -97,6 +101,10 @@ impl PermissionResolver for AllowAll {
 pub enum AgentEvent {
     /// Fragmento incremental de texto del asistente.
     Delta(String),
+    /// Snapshot del worktree tomado antes de ejecutar las tools con efectos del
+    /// paso actual. `message_index` apunta al mensaje del asistente con las
+    /// `tool_calls` dentro del `Vec<Message>` que vendrá en `Turn(..)`.
+    StepSnapshot { hash: String, message_index: usize },
     /// El modelo va a ejecutar una tool (tras conceder el permiso si lo requería).
     ToolStarted { name: String, arguments: String },
     /// Una tool terminó; `ok` indica si tuvo éxito.
@@ -136,10 +144,15 @@ impl Engine {
     /// Ejecuta un turno completo del agente: llama al proveedor, ejecuta las tools
     /// que solicite (resolviendo permisos), reinyecta los resultados y repite
     /// hasta que el modelo cierra el turno. Devuelve el stream de eventos.
+    ///
+    /// Si se provee `snapshots`, antes de ejecutar las tools de un paso que
+    /// requiera permiso, se captura el estado del worktree y se emite un
+    /// `AgentEvent::StepSnapshot` para que la UI lo asocie al mensaje del paso.
     pub fn run_turn(
         &self,
         history: Vec<Message>,
         ctx: ToolContext,
+        snapshots: Option<Snapshots>,
         resolver: Arc<dyn PermissionResolver>,
     ) -> AgentStream {
         let provider = self.provider.clone();
@@ -156,6 +169,11 @@ impl Engine {
             messages.push(Message::system(SYSTEM_PROMPT));
             messages.extend(history);
             let mut appended: Vec<Message> = Vec::new();
+            // Un único snapshot por turno, capturado antes del PRIMER paso con
+            // efectos. Revertir restaura el estado previo al turno entero
+            // (no a un paso intermedio): es la unidad mental natural para el
+            // usuario que pulsa "Revertir" tras ver la respuesta completa.
+            let mut snapshot_taken = false;
 
             for _ in 0..MAX_STEPS {
                 let mut inner = provider.stream_chat(messages.clone(), tool_specs.clone()).await?;
@@ -185,6 +203,35 @@ impl Engine {
                 let assistant_msg = Message::assistant_tool_calls(text, calls.clone());
                 messages.push(assistant_msg.clone());
                 appended.push(assistant_msg);
+                let assistant_index = appended.len() - 1;
+
+                // Si alguna de las tools del paso tiene efectos, captura un
+                // snapshot del worktree antes de ejecutarlas. La UI lo asocia
+                // al mensaje del asistente para ofrecer "Revertir". Un fallo
+                // del snapshot no aborta el paso: queda registrado y seguimos.
+                let any_writes = calls.iter().any(|c| {
+                    registry
+                        .get(&c.function.name)
+                        .map(|t| t.requires_permission())
+                        .unwrap_or(false)
+                });
+                if any_writes && !snapshot_taken {
+                    if let Some(snap) = snapshots.as_ref() {
+                        match snap.track().await {
+                            Ok(Some(hash)) => {
+                                snapshot_taken = true;
+                                yield AgentEvent::StepSnapshot {
+                                    hash,
+                                    message_index: assistant_index,
+                                };
+                            }
+                            Ok(None) => snapshot_taken = true,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "no se pudo tomar snapshot");
+                            }
+                        }
+                    }
+                }
 
                 for call in calls {
                     let name = call.function.name.clone();

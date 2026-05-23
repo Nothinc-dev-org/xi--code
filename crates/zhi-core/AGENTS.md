@@ -2,11 +2,13 @@
 
 > Lee `/AGENTS.md` y `docs/architecture.md` antes de tocar este crate.
 > Implementado: tipos de dominio (`Message`/`Role`), `Engine`/`Session` (Fase 1),
-> `store` —persistencia SQLite— (Fase 2) y el bucle de agente
+> `store` —persistencia SQLite— (Fase 2), el bucle de agente
 > (`Engine::run_turn` → `AgentEvent`) con tools y permisos
-> (`PermissionResolver`) (Fase 3, ver
-> [ADR-0007](../../docs/decisions/0007-tools-permisos-bucle-agente.md)).
-> Pendiente: snapshots/revert (3c), config, multi-proveedor.
+> (`PermissionResolver`) (Fase 3a/3b), y el módulo `snapshot` —repo git aislado
+> con `track`/`patch_files`/`restore`— integrado al bucle como un snapshot por
+> turno (Fase 3c). Ver
+> [ADR-0007](../../docs/decisions/0007-tools-permisos-bucle-agente.md).
+> Pendiente: config, multi-proveedor.
 
 ## Responsabilidad
 

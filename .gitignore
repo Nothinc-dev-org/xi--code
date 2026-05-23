@@ -3,10 +3,6 @@
 **/*.rs.bk
 *.pdb
 
-# Scratch local de desarrollo
-/HolaMundo
-/HolaMundo.rs
-
 # Bases de datos locales de desarrollo
 *.db
 *.db-journal

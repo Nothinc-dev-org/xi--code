@@ -74,13 +74,52 @@ estructurales que no estaban resueltas:
   `PRAGMA table_info(messages)` y solo se añade la columna ausente. Mantiene la
   estrategia "sin migraciones en disco" del [ADR-0006](0006-persistencia-sqlite.md).
 
-### Snapshots del worktree (`zhi-core`) — diferido a 3c
+### Snapshots del worktree (`zhi-core`) — Fase 3c
 
-- Checkpoint del worktree antes de aplicar cambios de archivos, con **revertir**.
-  Implica operaciones destructivas sobre archivos del usuario, así que se aborda
-  en un pase propio (3c). La estrategia prevista es git de plumbing sobre un
-  índice temporal (`GIT_INDEX_FILE` + `write-tree`/`commit-tree`) para no tocar
-  el índice ni el estado del usuario. Este ADR se ampliará al implementarlo.
+- **Repo git aislado**: cada proyecto tiene un `GIT_DIR` propio en
+  `$XDG_DATA_HOME/xiě-code/snapshots/<project_id>/`. Las llamadas usan el
+  binario `git` como subproceso (mismo patrón que `bash` en `zhi-tool`),
+  pasando `GIT_DIR` y `GIT_WORK_TREE` por entorno. **No se toca el `.git` del
+  usuario** ni su índice; el shadow vive en paralelo.
+- **API mínima** en `zhi-core::snapshot::Snapshots`:
+  - `open(workdir, git_dir)` → inicializa el shadow si no existe (con
+    `core.autocrlf=false`, `core.longpaths=true`, `core.symlinks=true`,
+    `core.fsmonitor=false`).
+  - `track()` → `git add --all` (sin pathspec explícito: respeta el
+    `.gitignore` del worktree y salta los archivos ignorados silenciosamente)
+    + `write-tree`; devuelve el hash.
+  - `patch_files(hash)` → stage + `git diff --cached --name-only <hash>`.
+  - `restore(hash)` → `read-tree <hash>` + `checkout-index -a -f`.
+- **Política de exclusión = el `.gitignore` del usuario**: nada de pathspecs
+  negativos propios, nada de `--force`. Si el usuario quiere que `target/`,
+  `node_modules/`, secretos (`.env`, `*.db`) o cualquier otra cosa queden
+  fuera del snapshot, lo expresa en su `.gitignore`. El shadow no decide por
+  él. Importante: `git add` **con pathspec explícito** (p. ej. `--`) falla
+  cuando hay archivos ignorados en el árbol; `git add --all` sin pathspec los
+  salta. Por eso usamos la segunda forma.
+- **Granularidad**: un único snapshot por **turno**, tomado antes del primer
+  paso del bucle que vaya a invocar al menos una tool con `requires_permission`.
+  Revertir restaura el estado previo al turno entero (no a un paso intermedio):
+  es la unidad mental natural para el usuario tras leer la respuesta completa.
+- **Asociación con el dominio**: nueva columna `snapshot TEXT NULL` en
+  `messages`, añadida con el mismo `ensure_column` idempotente que el resto
+  de columnas de Fase 3 (sin sistema de migraciones, ver
+  [ADR-0006](0006-persistencia-sqlite.md)). El hash se guarda contra el `id`
+  del mensaje del asistente que contiene las `tool_calls` del paso.
+- **Bucle y eventos**: `Engine::run_turn` recibe `Option<Snapshots>`. Cuando
+  toma un snapshot emite `AgentEvent::StepSnapshot { hash, message_index }`;
+  la UI lo guarda y, tras persistir los mensajes del turno, asocia el hash al
+  `message_id` correcto y pinta el botón "Revertir" en la última tarjeta de
+  tool del paso.
+- **UI**: la confirmación se hace con `adw::MessageDialog` (disponible desde
+  libadwaita 1.2, alineado con la feature actual `v1_2`; cuando en Fase 6 se
+  suba a `v1_5` para `NavigationSplitView`, migrar a `AlertDialog`). El
+  diálogo lista los primeros 20 archivos afectados.
+- **Degradación**: si `git` no está en `PATH`, `Snapshots::open` devuelve un
+  manager con `available() == false`; el motor sigue funcionando y la UI no
+  muestra el botón "Revertir". Un fallo puntual en `track` no aborta el paso:
+  queda registrado en `tracing::warn` y se continúa. Los snapshots son red de
+  seguridad, no precondición.
 
 ## Alternativas consideradas
 

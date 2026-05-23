@@ -52,12 +52,18 @@ Ver [ADR-0007](decisions/0007-tools-permisos-bucle-agente.md).
 - [x] Sistema de permisos con resolución en la UI: trait `PermissionResolver`
       + back-channel `oneshot`; `zhi-gtk` muestra controles permitir/denegar
       embebidos en la conversación y tarjetas de ejecución de tool.
-- [ ] **(3c)** Snapshots del worktree + revertir. Pendiente: implica operaciones
-      destructivas sobre archivos del usuario; se aborda en un pase propio.
+- [x] **(3c)** Snapshots del worktree + revertir. Repo git aislado (`GIT_DIR`
+      separado del `.git` del usuario, subproceso `git`); un snapshot por turno
+      capturado antes del primer paso con efectos; hash asociado al mensaje del
+      asistente (columna `snapshot` idempotente en `messages`); botón
+      "Revertir" en la última tarjeta del paso con diálogo de confirmación que
+      lista los archivos afectados. Si `git` no está en PATH, los snapshots
+      quedan deshabilitados sin afectar al resto de la app.
 
 > Verificado: `fmt`, `clippy -D warnings` y `test` del workspace en verde
-> (zhi-tool: 4 tests; zhi-core: round-trip del almacén) y build del binario.
-> Pendiente de validación visual en sesión gráfica del usuario.
+> (zhi-tool: 4 tests; zhi-core: 4 tests —round-trip del almacén y 3 de
+> snapshots—) y build del binario. Pendiente de validación visual en sesión
+> gráfica del usuario.
 
 ## Fase 4 — Agentes y multi-proveedor
 

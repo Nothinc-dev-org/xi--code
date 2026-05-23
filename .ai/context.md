@@ -39,13 +39,19 @@ lo que ya está en `docs/`; esto son punteros y estado.
 - **Fase 2 (persistencia y sesiones)** completa: módulo `zhi-core::store`
   (SQLite/`sqlx`) con proyectos/sesiones/mensajes; `zhi-gtk` con sidebar de
   sesiones, sesión nueva y reanudación de existentes. Todo persistido.
-- **Fase 3 (tools y permisos)** — 3a+3b completas, 3c (snapshots) pendiente:
-  `zhi-tool` (read/write/edit/list/glob/grep/bash, confinadas al worktree),
-  bucle de agente `Engine::run_turn`→`AgentEvent`, function calling en
-  `zhi-provider`, permisos con `PermissionResolver`+`oneshot` y diálogo en la UI.
-  `fmt`/`clippy -D warnings`/`test`/build del workspace en verde.
+- **Fase 3 (tools y permisos)** completa: `zhi-tool`
+  (read/write/edit/list/glob/grep/bash, confinadas al worktree), bucle de
+  agente `Engine::run_turn`→`AgentEvent`, function calling en `zhi-provider`,
+  permisos con `PermissionResolver`+`oneshot` y diálogo en la UI.
+  **Snapshots (3c)**: módulo `zhi-core::snapshot` con repo git aislado
+  (`GIT_DIR` separado bajo `$XDG_DATA_HOME/xiě-code/snapshots/<project_id>/`,
+  subproceso `git`); un snapshot por turno antes del primer paso con efectos,
+  asociado al mensaje del asistente vía columna `snapshot` en `messages`;
+  botón "Revertir" en la última tarjeta del paso con `adw::MessageDialog` que
+  lista los archivos afectados. `fmt`/`clippy -D warnings`/`test`/build del
+  workspace en verde.
 - Arranque: `DEEPSEEK_API_KEY=... cargo run -p zhi-gtk`.
-- Próximo hito: **Fase 3c — snapshots del worktree + revertir**. Ver
+- Próximo hito: **Fase 4 — agentes y multi-proveedor**. Ver
   [`docs/roadmap.md`](../docs/roadmap.md).
 
 ### Notas de implementación
