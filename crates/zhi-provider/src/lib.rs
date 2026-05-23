@@ -1,13 +1,15 @@
 //! Abstracción de proveedores de LLM y la implementación de DeepSeek.
 //!
-//! DeepSeek expone una API compatible con OpenAI (`POST /chat/completions` con
-//! `stream: true`, eventos SSE). Soporta *function calling*: la petición lleva un
-//! array `tools` y el stream devuelve `tool_calls` troceados que aquí se agregan.
-//! Ver `crates/zhi-provider/AGENTS.md`.
+//! El trait [`Provider`] es la abstracción común; [`DeepSeek`] es la primera
+//! implementación. DeepSeek expone una API compatible con OpenAI
+//! (`POST /chat/completions` con `stream: true`, eventos SSE). Soporta
+//! *function calling*: la petición lleva un array `tools` y el stream devuelve
+//! `tool_calls` troceados que aquí se agregan. Ver `crates/zhi-provider/AGENTS.md`.
 
 use std::pin::Pin;
 
 use async_stream::try_stream;
+use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 
 /// Error del crate. Cada proveedor mapea sus fallos a estas variantes.
@@ -151,29 +153,60 @@ pub enum StreamEvent {
 /// Stream de eventos de una respuesta del modelo.
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 
-/// Cliente del proveedor DeepSeek.
+/// Abstracción común de un proveedor de LLM. Los proveedores concretos
+/// (DeepSeek, OpenAI, …) implementan este trait; `zhi-core::Engine` lo posee
+/// detrás de un `Arc<dyn Provider>` para no acoplarse a uno concreto.
+#[async_trait]
+pub trait Provider: Send + Sync {
+    /// Envía la conversación (con las `tools` disponibles) y devuelve un stream
+    /// incremental: texto y, cuando el modelo lo pide, llamadas a tool agregadas.
+    async fn stream_chat(
+        &self,
+        messages: Vec<Message>,
+        tools: Vec<ToolSpec>,
+    ) -> Result<EventStream>;
+}
+
+/// Cliente para cualquier endpoint con API **compatible con OpenAI** (DeepSeek,
+/// OpenAI, Groq, vLLM, Ollama…). El protocolo (`POST /chat/completions`, SSE,
+/// `tool_calls` troceados) es idéntico; lo que cambia son `base_url` y `model`.
 #[derive(Debug, Clone)]
-pub struct DeepSeek {
+pub struct OpenAiCompatible {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
     model: String,
 }
 
-impl DeepSeek {
-    /// Crea un cliente con los valores por defecto (`deepseek-chat`).
-    pub fn new(api_key: impl Into<String>) -> Self {
+impl OpenAiCompatible {
+    /// Cliente genérico para cualquier endpoint compatible con OpenAI.
+    pub fn new(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
-            base_url: "https://api.deepseek.com".to_string(),
-            model: "deepseek-chat".to_string(),
+            base_url: base_url.into(),
+            model: model.into(),
         }
     }
 
-    /// Envía la conversación (con las `tools` disponibles) y devuelve un stream
-    /// incremental: texto y, cuando el modelo lo pide, llamadas a tool agregadas.
-    pub async fn stream_chat(
+    /// Cliente con los valores por defecto de DeepSeek (`deepseek-chat`).
+    pub fn deepseek(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, "https://api.deepseek.com", "deepseek-chat")
+    }
+
+    /// Cliente con los valores por defecto de OpenAI (`gpt-4o-mini`).
+    pub fn openai(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, "https://api.openai.com/v1", "gpt-4o-mini")
+    }
+}
+
+#[async_trait]
+impl Provider for OpenAiCompatible {
+    async fn stream_chat(
         &self,
         messages: Vec<Message>,
         tools: Vec<ToolSpec>,

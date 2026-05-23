@@ -1,9 +1,16 @@
 # AGENTS.md — zhi-provider
 
-> Implementado: cliente **DeepSeek** (API estilo OpenAI) con streaming SSE
-> (Fase 1) y *function calling* —`tools` en la petición, agregación de
-> `tool_calls` del stream— (Fase 3). El trait `Provider` y otros proveedores
-> llegan en Fase 4. Lee `/AGENTS.md` y `docs/architecture.md` antes de tocarlo.
+> Implementado: trait `Provider` (Fase 4) y un único cliente
+> `OpenAiCompatible` que cubre cualquier endpoint con API estilo OpenAI
+> (DeepSeek, OpenAI, Groq, vLLM, Ollama, …) — `::deepseek(key)` /
+> `::openai(key)` para los dos defaults; `::new(key, base_url, model)` para
+> compatibles arbitrarios. Streaming SSE (Fase 1) y *function calling*
+> —`tools` en la petición, agregación de `tool_calls` del stream— (Fase 3).
+> `zhi-core::Engine` posee `Arc<dyn Provider>` y elige proveedor en
+> `from_env` según `DEEPSEEK_API_KEY` u `OPENAI_API_KEY`. Pendiente:
+> selector de modelo en la UI, otros formatos no-OpenAI (Anthropic) si
+> entran.
+> Lee `/AGENTS.md` y `docs/architecture.md` antes de tocarlo.
 
 ## Responsabilidad
 

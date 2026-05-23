@@ -15,12 +15,15 @@ use sqlx::SqlitePool;
 
 use zhi_provider::{Message, Role, ToolCall};
 
+use crate::AgentKind;
+
 /// Metadatos de una sesión para listarla en la UI (sin sus mensajes).
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct SessionMeta {
     pub id: i64,
     pub title: String,
     pub updated_at: String,
+    pub agent: AgentKind,
 }
 
 /// Almacén persistente. Clonable y barato de compartir entre tareas: envuelve un
@@ -92,6 +95,9 @@ impl Store {
         // Hash del snapshot (Fase 3c): se asocia al mensaje del asistente que
         // contiene las `tool_calls` del paso. Ver ADR-0007.
         self.ensure_column("messages", "snapshot").await?;
+        // Perfil del agente activo de la sesión (Fase 4): "build" o "plan".
+        // NULL en sesiones antiguas → tratadas como `Build` por defecto.
+        self.ensure_column("sessions", "agent").await?;
         Ok(())
     }
 
@@ -128,21 +134,38 @@ impl Store {
 
     /// Lista las sesiones de un proyecto, de la más reciente a la más antigua.
     pub async fn list_sessions(&self, project_id: i64) -> crate::Result<Vec<SessionMeta>> {
-        let rows = sqlx::query_as::<_, SessionMeta>(
-            "SELECT id, title, updated_at FROM sessions
+        let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, title, updated_at, agent FROM sessions
              WHERE project_id = ? ORDER BY updated_at DESC, id DESC",
         )
         .bind(project_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows)
+        Ok(rows
+            .into_iter()
+            .map(|(id, title, updated_at, agent)| SessionMeta {
+                id,
+                title,
+                updated_at,
+                agent: agent
+                    .as_deref()
+                    .map(AgentKind::from_str_or_default)
+                    .unwrap_or_default(),
+            })
+            .collect())
     }
 
-    /// Crea una sesión nueva y devuelve sus metadatos.
-    pub async fn create_session(&self, project_id: i64, title: &str) -> crate::Result<SessionMeta> {
-        let id = sqlx::query("INSERT INTO sessions (project_id, title) VALUES (?, ?)")
+    /// Crea una sesión nueva con el `agent` indicado y devuelve sus metadatos.
+    pub async fn create_session(
+        &self,
+        project_id: i64,
+        title: &str,
+        agent: AgentKind,
+    ) -> crate::Result<SessionMeta> {
+        let id = sqlx::query("INSERT INTO sessions (project_id, title, agent) VALUES (?, ?, ?)")
             .bind(project_id)
             .bind(title)
+            .bind(agent.as_str())
             .execute(&self.pool)
             .await?
             .last_insert_rowid();
@@ -155,6 +178,7 @@ impl Store {
             id,
             title: title.to_string(),
             updated_at,
+            agent,
         })
     }
 
@@ -162,6 +186,27 @@ impl Store {
     pub async fn rename_session(&self, session_id: i64, title: &str) -> crate::Result<()> {
         sqlx::query("UPDATE sessions SET title = ?, updated_at = datetime('now') WHERE id = ?")
             .bind(title)
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Elimina una sesión y, en cascada, todos sus mensajes (ON DELETE
+    /// CASCADE en `messages.session_id`).
+    pub async fn delete_session(&self, session_id: i64) -> crate::Result<()> {
+        sqlx::query("DELETE FROM sessions WHERE id = ?")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Cambia el agente activo de una sesión (sin tocar `updated_at`: cambiar
+    /// de perfil no es actividad nueva).
+    pub async fn set_session_agent(&self, session_id: i64, agent: AgentKind) -> crate::Result<()> {
+        sqlx::query("UPDATE sessions SET agent = ? WHERE id = ?")
+            .bind(agent.as_str())
             .bind(session_id)
             .execute(&self.pool)
             .await?;
@@ -322,7 +367,18 @@ mod tests {
 
         assert!(store.list_sessions(project).await.unwrap().is_empty());
 
-        let session = store.create_session(project, "Nueva sesión").await.unwrap();
+        let session = store
+            .create_session(project, "Nueva sesión", AgentKind::Build)
+            .await
+            .unwrap();
+        assert_eq!(session.agent, AgentKind::Build);
+
+        store
+            .set_session_agent(session.id, AgentKind::Plan)
+            .await
+            .unwrap();
+        let listed = store.list_sessions(project).await.unwrap();
+        assert_eq!(listed.first().map(|s| s.agent), Some(AgentKind::Plan));
         store
             .append_message(session.id, &Message::user("hola"))
             .await

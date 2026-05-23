@@ -4,11 +4,13 @@
 > Implementado: tipos de dominio (`Message`/`Role`), `Engine`/`Session` (Fase 1),
 > `store` —persistencia SQLite— (Fase 2), el bucle de agente
 > (`Engine::run_turn` → `AgentEvent`) con tools y permisos
-> (`PermissionResolver`) (Fase 3a/3b), y el módulo `snapshot` —repo git aislado
+> (`PermissionResolver`) (Fase 3a/3b), el módulo `snapshot` —repo git aislado
 > con `track`/`patch_files`/`restore`— integrado al bucle como un snapshot por
-> turno (Fase 3c). Ver
+> turno (Fase 3c), y el perfil `AgentKind` (`Build`/`Plan`) que controla el
+> system prompt y filtra las tools ofrecidas al modelo (Fase 4). Persistido por
+> sesión en la columna `agent` de `sessions`. Ver
 > [ADR-0007](../../docs/decisions/0007-tools-permisos-bucle-agente.md).
-> Pendiente: config, multi-proveedor.
+> Pendiente: subagentes, agentes personalizados desde config.
 
 ## Responsabilidad
 

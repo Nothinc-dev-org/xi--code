@@ -19,8 +19,8 @@ use futures::StreamExt;
 use relm4::adw::prelude::*;
 use relm4::{adw, gtk, Component, ComponentParts, ComponentSender, RelmApp, RelmWidgetExt};
 use zhi_core::{
-    AgentEvent, Engine, Message, PermissionDecision, PermissionRequest, PermissionResolver, Role,
-    Session, SessionMeta, Snapshots, Store, ToolContext,
+    AgentEvent, AgentKind, Engine, Message, PermissionDecision, PermissionRequest,
+    PermissionResolver, Role, Session, SessionMeta, Snapshots, Store, ToolContext,
 };
 
 const APP_ID: &str = "ai.xiecode.App";
@@ -43,6 +43,9 @@ struct App {
     sessions: Vec<SessionMeta>,
     /// Sesión seleccionada actualmente.
     current_session: Option<i64>,
+    /// Perfil del agente activo en la sesión actual. Persistido por sesión;
+    /// las nuevas heredan el valor activo en el momento de su creación.
+    current_agent: AgentKind,
     /// Historial en memoria de la sesión activa.
     session: Session,
     /// Label del mensaje del asistente que se está transmitiendo ahora mismo.
@@ -90,8 +93,19 @@ enum Msg {
     NewSession,
     /// Se creó una sesión nueva.
     SessionCreated(SessionMeta),
+    /// El usuario pidió eliminar una sesión desde el menú contextual del sidebar.
+    DeleteSessionRequest(i64),
+    /// El usuario confirmó la eliminación en el diálogo.
+    DeleteSessionConfirmed(i64),
+    /// La sesión se eliminó del store: limpiar UI y, si era la activa, abrir
+    /// otra si la hay.
+    SessionDeleted(i64),
     /// Se renombró una sesión (al enviar su primer mensaje).
     Renamed { id: i64, title: String },
+    /// El usuario cambió el agente activo desde el selector.
+    AgentChanged(AgentKind),
+    /// Alternar entre Build y Plan (atajo Shift+Tab desde el campo de entrada).
+    ToggleAgent,
     /// El usuario envía un prompt.
     Send(String),
     /// Llega un fragmento de texto del asistente.
@@ -228,6 +242,40 @@ impl Component for App {
                         set_spacing: 6,
                         set_margin_all: 12,
 
+                        gtk::Box {
+                            set_orientation: gtk::Orientation::Horizontal,
+                            add_css_class: "linked",
+
+                            #[name = "agent_build"]
+                            gtk::ToggleButton {
+                                set_label: "Build",
+                                set_active: true,
+                                add_css_class: "agent-build",
+                                set_tooltip_text: Some(
+                                    "Acceso completo: lee, escribe, ejecuta (Shift+Tab para alternar)",
+                                ),
+                                connect_toggled[sender] => move |b| {
+                                    if b.is_active() {
+                                        sender.input(Msg::AgentChanged(AgentKind::Build));
+                                    }
+                                },
+                            },
+
+                            #[name = "agent_plan"]
+                            gtk::ToggleButton {
+                                set_label: "Plan",
+                                add_css_class: "agent-plan",
+                                set_tooltip_text: Some(
+                                    "Solo lectura: lee y propone, no modifica (Shift+Tab para alternar)",
+                                ),
+                                connect_toggled[sender] => move |b| {
+                                    if b.is_active() {
+                                        sender.input(Msg::AgentChanged(AgentKind::Plan));
+                                    }
+                                },
+                            },
+                        },
+
                         #[name = "entry"]
                         gtk::Entry {
                             set_hexpand: true,
@@ -282,6 +330,7 @@ impl Component for App {
             project_id: None,
             sessions: Vec::new(),
             current_session: None,
+            current_agent: AgentKind::default(),
             session: Session::new(),
             streaming_label: None,
             tool_output: None,
@@ -295,11 +344,32 @@ impl Component for App {
 
         let widgets = view_output!();
 
+        // Enlaza los dos toggles como grupo radio (uno activo a la vez).
+        widgets.agent_plan.set_group(Some(&widgets.agent_build));
+
+        // Atajo Shift+Tab en el campo de entrada para alternar Build/Plan. Se
+        // registra como `ShortcutController` local al Entry: solo dispara con
+        // el campo enfocado y devuelve `Stop` para no propagarse a la
+        // navegación por foco de GTK.
+        {
+            let controller = gtk::ShortcutController::new();
+            let trigger =
+                gtk::ShortcutTrigger::parse_string("<Shift>Tab").expect("trigger Shift+Tab válido");
+            let sender_action = sender.clone();
+            let action = gtk::CallbackAction::new(move |_, _| {
+                sender_action.input(Msg::ToggleAgent);
+                gtk::glib::Propagation::Stop
+            });
+            controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
+            widgets.entry.add_controller(controller);
+        }
+
         if model.engine.is_none() {
             append_bubble(
                 &widgets.chat_list,
                 Role::System,
-                "No se encontró DEEPSEEK_API_KEY en el entorno. Expórtala y reinicia la app.",
+                "Falta una clave de proveedor en el entorno. Exporta DEEPSEEK_API_KEY \
+                 (preferido) u OPENAI_API_KEY y reinicia la app.",
             );
         }
 
@@ -349,7 +419,7 @@ impl Component for App {
                 if self.sessions.is_empty() {
                     sender.input(Msg::NewSession);
                 } else {
-                    rebuild_session_list(&widgets.session_list, &self.sessions, 0);
+                    rebuild_session_list(&widgets.session_list, &self.sessions, 0, &sender);
                 }
 
                 // Inicializa el manager de snapshots para este proyecto. El
@@ -384,6 +454,7 @@ impl Component for App {
                     return; // Ya está cargada (p. ej. selección programática).
                 }
                 self.current_session = Some(id);
+                self.current_agent = meta.agent;
                 self.streaming_label = None;
                 self.tool_output = None;
                 self.tool_card = None;
@@ -427,9 +498,13 @@ impl Component for App {
                 let (Some(store), Some(project_id)) = (self.store.clone(), self.project_id) else {
                     return;
                 };
+                let agent = self.current_agent;
                 let sender = sender.clone();
                 relm4::spawn(async move {
-                    match store.create_session(project_id, "Nueva sesión").await {
+                    match store
+                        .create_session(project_id, "Nueva sesión", agent)
+                        .await
+                    {
                         Ok(meta) => sender.input(Msg::SessionCreated(meta)),
                         Err(err) => sender.input(Msg::Failed(err.to_string())),
                     }
@@ -438,6 +513,7 @@ impl Component for App {
 
             Msg::SessionCreated(meta) => {
                 let id = meta.id;
+                self.current_agent = meta.agent;
                 self.sessions.insert(0, meta);
                 self.current_session = Some(id);
                 self.session = Session::new();
@@ -445,7 +521,94 @@ impl Component for App {
                 self.tool_output = None;
                 self.partial.clear();
                 clear_chat(&widgets.chat_list);
-                rebuild_session_list(&widgets.session_list, &self.sessions, 0);
+                rebuild_session_list(&widgets.session_list, &self.sessions, 0, &sender);
+            }
+
+            Msg::DeleteSessionRequest(session_id) => {
+                if self.busy {
+                    return;
+                }
+                let Some(meta) = self.sessions.iter().find(|m| m.id == session_id) else {
+                    return;
+                };
+                let title = meta.title.clone();
+                let sender_dialog = sender.clone();
+                show_delete_session_dialog(root, &title, move |confirmed| {
+                    if confirmed {
+                        sender_dialog.input(Msg::DeleteSessionConfirmed(session_id));
+                    }
+                });
+            }
+
+            Msg::DeleteSessionConfirmed(session_id) => {
+                let Some(store) = self.store.clone() else {
+                    return;
+                };
+                let sender = sender.clone();
+                relm4::spawn(async move {
+                    match store.delete_session(session_id).await {
+                        Ok(()) => sender.input(Msg::SessionDeleted(session_id)),
+                        Err(err) => sender.input(Msg::Failed(err.to_string())),
+                    }
+                });
+            }
+
+            Msg::SessionDeleted(session_id) => {
+                self.sessions.retain(|m| m.id != session_id);
+                let was_active = self.current_session == Some(session_id);
+                if was_active {
+                    self.current_session = None;
+                    self.session = Session::new();
+                    self.streaming_label = None;
+                    self.tool_output = None;
+                    self.tool_card = None;
+                    self.revertible_card = None;
+                    self.pending_snapshot = None;
+                    self.message_snapshots.clear();
+                    self.partial.clear();
+                    clear_chat(&widgets.chat_list);
+                }
+                let selected = if was_active && !self.sessions.is_empty() {
+                    0
+                } else {
+                    self.current_session
+                        .and_then(|cur| self.sessions.iter().position(|m| m.id == cur))
+                        .map(|i| i as i32)
+                        .unwrap_or(-1)
+                };
+                rebuild_session_list(&widgets.session_list, &self.sessions, selected, &sender);
+                if was_active && !self.sessions.is_empty() {
+                    sender.input(Msg::SelectIndex(0));
+                }
+            }
+
+            Msg::ToggleAgent => {
+                let kind = match self.current_agent {
+                    AgentKind::Build => AgentKind::Plan,
+                    AgentKind::Plan => AgentKind::Build,
+                };
+                sender.input(Msg::AgentChanged(kind));
+            }
+
+            Msg::AgentChanged(kind) => {
+                if self.current_agent == kind {
+                    return; // Eco de la sincronización programática del toggle.
+                }
+                self.current_agent = kind;
+                if let (Some(store), Some(id)) = (self.store.clone(), self.current_session) {
+                    relm4::spawn(async move {
+                        if let Err(err) = store.set_session_agent(id, kind).await {
+                            tracing::warn!(%err, "no se pudo persistir el agente");
+                        }
+                    });
+                }
+                if let Some(meta) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|m| Some(m.id) == self.current_session)
+                {
+                    meta.agent = kind;
+                }
             }
 
             Msg::Renamed { id, title } => {
@@ -456,7 +619,12 @@ impl Component for App {
                     .current_session
                     .and_then(|cur| self.sessions.iter().position(|m| m.id == cur))
                     .unwrap_or(0);
-                rebuild_session_list(&widgets.session_list, &self.sessions, selected as i32);
+                rebuild_session_list(
+                    &widgets.session_list,
+                    &self.sessions,
+                    selected as i32,
+                    &sender,
+                );
             }
 
             Msg::Send(text) => {
@@ -516,9 +684,10 @@ impl Component for App {
                 });
                 let history = self.session.history();
                 let snapshots = self.snapshots.clone();
+                let agent = self.current_agent;
                 let sender = sender.clone();
                 relm4::spawn(async move {
-                    let mut stream = engine.run_turn(history, ctx, snapshots, resolver);
+                    let mut stream = engine.run_turn(agent, history, ctx, snapshots, resolver);
                     while let Some(event) = stream.next().await {
                         match event {
                             Ok(AgentEvent::Delta(d)) => sender.input(Msg::Delta(d)),
@@ -741,11 +910,21 @@ async fn bootstrap(store: &Store, project_path: &str) -> zhi_core::Result<(i64, 
     Ok((project_id, sessions))
 }
 
-/// Habilita/inhabilita el envío según haya motor, sesión y no estemos ocupados.
+/// Habilita/inhabilita el envío según haya motor, sesión y no estemos ocupados,
+/// y refleja el agente activo en los toggles (sin disparar el handler: el
+/// `AgentChanged` neutraliza el eco comparando con `current_agent`).
 fn update_controls(model: &App, widgets: &AppWidgets) {
     let ready = model.engine.is_some() && model.current_session.is_some() && !model.busy;
     widgets.entry.set_sensitive(ready);
     widgets.send_button.set_sensitive(ready);
+
+    let toggles_enabled = model.current_session.is_some() && !model.busy;
+    widgets.agent_build.set_sensitive(toggles_enabled);
+    widgets.agent_plan.set_sensitive(toggles_enabled);
+    match model.current_agent {
+        AgentKind::Build => widgets.agent_build.set_active(true),
+        AgentKind::Plan => widgets.agent_plan.set_active(true),
+    }
 }
 
 /// Resumen corto para el título de una sesión a partir de su primer mensaje.
@@ -760,8 +939,14 @@ fn summarize_title(text: &str) -> String {
 }
 
 /// Reconstruye las filas del sidebar y selecciona la fila `selected` (la
-/// selección programática se neutraliza en `Msg::SelectIndex`).
-fn rebuild_session_list(list: &gtk::ListBox, sessions: &[SessionMeta], selected: i32) {
+/// selección programática se neutraliza en `Msg::SelectIndex`). Engancha en
+/// cada fila un menú contextual con la opción de eliminar.
+fn rebuild_session_list(
+    list: &gtk::ListBox,
+    sessions: &[SessionMeta],
+    selected: i32,
+    sender: &ComponentSender<App>,
+) {
     clear_list(list);
     for meta in sessions {
         let label = gtk::Label::new(Some(&meta.title));
@@ -770,10 +955,44 @@ fn rebuild_session_list(list: &gtk::ListBox, sessions: &[SessionMeta], selected:
         label.set_max_width_chars(28);
         label.set_ellipsize(relm4::gtk::pango::EllipsizeMode::End);
         list.append(&label);
+        // `ListBox::append` envuelve el hijo en una `ListBoxRow`: ese es el
+        // widget al que adjuntamos el gesto de clic derecho.
+        if let Some(row) = label.parent() {
+            attach_session_context_menu(&row, meta.id, sender);
+        }
     }
     if let Some(row) = list.row_at_index(selected) {
         list.select_row(Some(&row));
     }
+}
+
+/// Adjunta a la fila del sidebar un `Popover` con la acción de eliminar y un
+/// `GestureClick` que lo despliega al hacer clic derecho.
+fn attach_session_context_menu(row: &gtk::Widget, session_id: i64, sender: &ComponentSender<App>) {
+    let popover = gtk::Popover::new();
+    popover.set_has_arrow(false);
+    popover.set_parent(row);
+
+    let delete = gtk::Button::with_label("Eliminar");
+    delete.add_css_class("flat");
+    delete.add_css_class("destructive-action");
+    {
+        let popover = popover.clone();
+        let sender = sender.clone();
+        delete.connect_clicked(move |_| {
+            popover.popdown();
+            sender.input(Msg::DeleteSessionRequest(session_id));
+        });
+    }
+    popover.set_child(Some(&delete));
+
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
+    gesture.connect_pressed(move |_, _, x, y| {
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.popup();
+    });
+    row.add_controller(gesture);
 }
 
 fn clear_list(list: &gtk::ListBox) {
@@ -982,6 +1201,25 @@ fn show_revert_dialog(
     dialog.present();
 }
 
+/// Diálogo destructivo de confirmación para eliminar una sesión.
+fn show_delete_session_dialog(
+    parent: &adw::ApplicationWindow,
+    title: &str,
+    on_response: impl Fn(bool) + 'static,
+) {
+    let body = format!("¿Eliminar la sesión «{title}»?\n\nSe borrarán también todos sus mensajes.");
+    let dialog = adw::MessageDialog::new(Some(parent), Some("Eliminar sesión"), Some(&body));
+    dialog.add_response("cancel", "Cancelar");
+    dialog.add_response("delete", "Eliminar");
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(None, move |_dialog, response| {
+        on_response(response == "delete");
+    });
+    dialog.present();
+}
+
 fn append_permission_controls(
     chat_list: &gtk::Box,
     tool_name: &str,
@@ -1083,6 +1321,34 @@ fn scroll_to_bottom(scroller: &gtk::ScrolledWindow) {
     });
 }
 
+/// CSS de la app. Solo el estado activo (`:checked`) lleva color; el inactivo
+/// queda con el estilo neutro del tema para preservar la pista visual de cuál
+/// está seleccionado en el segmented control Build/Plan.
+const APP_CSS: &str = "
+    .agent-build:checked {
+        background-image: none;
+        background-color: #1c71d8;
+        color: white;
+    }
+    .agent-plan:checked {
+        background-image: none;
+        background-color: #daa520;
+        color: white;
+    }
+";
+
+fn install_css() {
+    let provider = gtk::CssProvider::new();
+    provider.load_from_data(APP_CSS);
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1091,5 +1357,6 @@ fn main() {
         .init();
 
     let app = RelmApp::new(APP_ID);
+    install_css();
     app.run::<App>(());
 }

@@ -67,7 +67,18 @@ lo que ya está en `docs/`; esto son punteros y estado.
 - **Render Markdown**: durante el stream se muestra texto plano (`set_text`); al
   terminar el turno se convierte a marcado Pango (`markdown::to_pango` con
   `pulldown-cmark`) y se aplica con `set_markup`, para evitar markup a medias.
-- `DeepSeek` es un cliente **concreto**; el trait `Provider` se extraerá en Fase 4.
+- **Proveedor LLM**: trait `Provider` en `zhi-provider`; un único cliente
+  `OpenAiCompatible` con constructores `::deepseek(key)`, `::openai(key)` y
+  `::new(key, base_url, model)` cubre cualquier endpoint estilo OpenAI.
+  `Engine::from_env` elige entre `DEEPSEEK_API_KEY` (preferido) u
+  `OPENAI_API_KEY`. `Engine` posee `Arc<dyn Provider>`.
+- **Agentes**: `AgentKind` (`Build`/`Plan`) en `zhi-core` determina el system
+  prompt y filtra las tools que se exponen al modelo (`Plan` solo lectura).
+  `Engine::run_turn(agent, ...)`. Persistido en `sessions.agent`. Selector
+  Build/Plan linked a la izquierda del campo de entrada; atajo `Shift+Tab`
+  desde el `entry` (ShortcutController local con `Propagation::Stop` para no
+  caer en la navegación por foco). Se deshabilita durante un turno y se
+  sincroniza al cargar/crear sesión.
 - **Bucle de agente/UI**: `Engine::run_turn(history, ctx, resolver)` devuelve un
   stream de `AgentEvent` (Delta / ToolStarted / ToolFinished / Turn). La UI lo
   consume en `relm4::spawn` y reenvía cada evento como `Msg`. Los permisos van por

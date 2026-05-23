@@ -89,7 +89,15 @@ estructurales que no estaban resueltas:
     `.gitignore` del worktree y salta los archivos ignorados silenciosamente)
     + `write-tree`; devuelve el hash.
   - `patch_files(hash)` → stage + `git diff --cached --name-only <hash>`.
-  - `restore(hash)` → `read-tree <hash>` + `checkout-index -a -f`.
+  - `restore(hash, files)` → para cada archivo del patch, `git checkout <hash>
+    -- <file>` para restaurar su contenido. Si el checkout falla y `ls-tree`
+    confirma que el archivo no estaba en el snapshot, se **elimina del
+    worktree** (sirve para los archivos creados por el agente tras el
+    snapshot). Estrategia tomada de OpenCode
+    (`packages/opencode/src/snapshot/index.ts:363`). La alternativa más
+    obvia, `read-tree + checkout-index -a -f`, **no borra** los archivos
+    nuevos: solo restaura los del index, lo que dejaba revertir como "no
+    pasa nada" para creaciones puras.
 - **Política de exclusión = el `.gitignore` del usuario**: nada de pathspecs
   negativos propios, nada de `--force`. Si el usuario quiere que `target/`,
   `node_modules/`, secretos (`.env`, `*.db`) o cualquier otra cosa queden
@@ -110,7 +118,11 @@ estructurales que no estaban resueltas:
   toma un snapshot emite `AgentEvent::StepSnapshot { hash, message_index }`;
   la UI lo guarda y, tras persistir los mensajes del turno, asocia el hash al
   `message_id` correcto y pinta el botón "Revertir" en la última tarjeta de
-  tool del paso.
+  tool del paso. La tarjeta se traslada de `tool_card` a `revertible_card` al
+  cerrar el turno para sobrevivir a un nuevo `Send` que pudiera llegar antes
+  del `SnapshotPersisted`; si la tarjeta acabara desligada del chat (sesión
+  recargada), el botón cae como fila propia al final del chat para no perder
+  la acción.
 - **UI**: la confirmación se hace con `adw::MessageDialog` (disponible desde
   libadwaita 1.2, alineado con la feature actual `v1_2`; cuando en Fase 6 se
   suba a `v1_5` para `NavigationSplitView`, migrar a `AlertDialog`). El

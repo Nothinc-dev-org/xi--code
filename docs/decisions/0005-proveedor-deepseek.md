@@ -30,8 +30,16 @@ El trait común se extraerá en la Fase 4, cuando entre el segundo proveedor.
 
 ## Consecuencias
 
-- `zhi-core::Engine` depende hoy del cliente concreto de DeepSeek; al extraer el
-  trait `Provider` (Fase 4) el `Engine` pasará a depender del trait, no del tipo.
-- El formato compatible con OpenAI reduce el coste de añadir más proveedores.
-- La `base_url` y el `model` tienen valores por defecto en el cliente; se harán
-  configurables vía config de usuario en fases posteriores.
+- ~~`zhi-core::Engine` depende hoy del cliente concreto de DeepSeek; al extraer
+  el trait `Provider` (Fase 4) el `Engine` pasará a depender del trait, no del
+  tipo.~~ **Cumplido (Fase 4)**: `Engine` posee `Arc<dyn Provider>`.
+- ~~El formato compatible con OpenAI reduce el coste de añadir más proveedores.~~
+  **Cumplido (Fase 4)**: el cliente concreto pasó de llamarse `DeepSeek` a
+  `OpenAiCompatible` con constructores `::deepseek(key)`, `::openai(key)` y
+  `::new(key, base_url, model)` para cualquier endpoint compatible. DeepSeek y
+  OpenAI comparten la **misma** implementación porque el protocolo es idéntico;
+  duplicar habría sido over-engineering. `Engine::from_env` elige entre ambos
+  según `DEEPSEEK_API_KEY` (preferido) u `OPENAI_API_KEY`.
+- La `base_url` y el `model` tienen valores por defecto en cada constructor;
+  un selector de modelo en la UI y la configurabilidad desde config de usuario
+  entran más adelante en Fase 4.

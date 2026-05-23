@@ -61,15 +61,24 @@ Ver [ADR-0007](decisions/0007-tools-permisos-bucle-agente.md).
       quedan deshabilitados sin afectar al resto de la app.
 
 > Verificado: `fmt`, `clippy -D warnings` y `test` del workspace en verde
-> (zhi-tool: 4 tests; zhi-core: 4 tests —round-trip del almacén y 3 de
-> snapshots—) y build del binario. Pendiente de validación visual en sesión
-> gráfica del usuario.
+> (zhi-tool: 4 tests; zhi-core: 7 tests —1 de `store` y 6 de `snapshot`
+> incluyendo regresiones de `.gitignore` y de revertir creaciones del
+> agente—) y build del binario. Pendiente de validación final del usuario en
+> sesión gráfica tras el fix de revertir file-by-file.
 
 ## Fase 4 — Agentes y multi-proveedor
 
-- [ ] Agentes `build` y `plan`; cambio de agente.
+- [x] Agentes `build` y `plan`; cambio de agente. `AgentKind` en `zhi-core`
+      define el system prompt y filtra las tools ofrecidas al modelo
+      (`Plan` = solo lectura). Persistido por sesión (columna `agent` de
+      `sessions`). Selector linked Build/Plan a la izquierda del campo de
+      entrada; atajo `Shift+Tab` desde el campo para alternar.
+      Deshabilitado durante un turno.
 - [ ] Subagentes para tareas multi-paso.
-- [ ] Proveedores adicionales (OpenAI y compatibles); selector de modelo.
+- [x] Trait `Provider` extraído (`zhi-core::Engine` posee `Arc<dyn Provider>`);
+      cliente único `OpenAiCompatible` cubriendo DeepSeek, OpenAI y cualquier
+      endpoint compatible; `Engine::from_env` elige por `DEEPSEEK_API_KEY` /
+      `OPENAI_API_KEY`. Pendiente del ítem: selector de modelo en la UI.
 - [ ] Agentes personalizados desde config.
 
 ## Fase 5 — MCP y LSP

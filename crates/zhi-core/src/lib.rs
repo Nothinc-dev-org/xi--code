@@ -22,7 +22,7 @@ use futures::{Stream, StreamExt};
 
 pub use snapshot::Snapshots;
 pub use store::{SessionMeta, Store};
-pub use zhi_provider::{EventStream, Message, Role, StreamEvent, ToolCall};
+pub use zhi_provider::{EventStream, Message, Provider, Role, StreamEvent, ToolCall};
 pub use zhi_tool::{ToolContext, ToolRegistry};
 
 /// Error del crate. Agrega los errores de los subsistemas del motor.
@@ -40,21 +40,73 @@ pub enum Error {
     Storage(#[from] sqlx::Error),
     #[error("error de snapshot: {0}")]
     Snapshot(String),
-    #[error("falta la variable de entorno DEEPSEEK_API_KEY")]
+    #[error("falta una clave de proveedor en el entorno (DEEPSEEK_API_KEY u OPENAI_API_KEY)")]
     MissingApiKey,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Prompt de sistema por defecto del agente.
-const SYSTEM_PROMPT: &str = "Eres xiě-code, un asistente de programación útil y conciso. \
-Operas sobre el directorio de trabajo del usuario y dispones de tools para leer, \
-escribir y editar archivos, buscar (glob/grep) y ejecutar comandos de shell. \
-Usa las tools cuando necesites inspeccionar o modificar el proyecto, y explica lo \
-que haces. Respondes en el idioma del usuario y usas Markdown cuando ayuda.";
-
 /// Límite de iteraciones del bucle de agente por turno (cortafuegos anti-bucle).
 const MAX_STEPS: usize = 16;
+
+// ── Perfiles de agente ───────────────────────────────────────────────────────
+
+/// Perfil de comportamiento del agente. `Build` tiene acceso completo a las
+/// tools; `Plan` queda en **solo lectura**: no se ofrecen las tools con efectos
+/// al modelo y si las pide igualmente, se rechaza la ejecución. Ver
+/// [`docs/architecture.md` §4](../../docs/architecture.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentKind {
+    /// Acceso completo: lee, escribe, edita, ejecuta shell.
+    #[default]
+    Build,
+    /// Solo lectura: lee y propone, nunca modifica el worktree.
+    Plan,
+}
+
+impl AgentKind {
+    /// `true` si el agente puede ejecutar tools con efectos (las que
+    /// `Tool::requires_permission()`).
+    pub fn allows_writes(self) -> bool {
+        matches!(self, AgentKind::Build)
+    }
+
+    /// Prompt de sistema que se inyecta como primer mensaje del turno.
+    pub fn system_prompt(self) -> &'static str {
+        match self {
+            AgentKind::Build => {
+                "Eres xiě-code, un asistente de programación útil y conciso. \
+                 Operas sobre el directorio de trabajo del usuario y dispones de tools para leer, \
+                 escribir y editar archivos, buscar (glob/grep) y ejecutar comandos de shell. \
+                 Usa las tools cuando necesites inspeccionar o modificar el proyecto, y explica lo \
+                 que haces. Respondes en el idioma del usuario y usas Markdown cuando ayuda."
+            }
+            AgentKind::Plan => {
+                "Eres xiě-code en modo plan: un asistente de **solo lectura**. Puedes leer \
+                 archivos, listar directorios y buscar con glob/grep, pero NUNCA modifiques el \
+                 proyecto: no escribas ni edites archivos, no ejecutes comandos de shell. Si el \
+                 usuario pide cambios, explica qué harías paso a paso y por qué, sin aplicarlos. \
+                 Respondes en el idioma del usuario y usas Markdown cuando ayuda."
+            }
+        }
+    }
+
+    /// Etiqueta corta para persistencia y para la UI.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentKind::Build => "build",
+            AgentKind::Plan => "plan",
+        }
+    }
+
+    /// Inversa de [`AgentKind::as_str`]; valores desconocidos caen a `Build`.
+    pub fn from_str_or_default(s: &str) -> Self {
+        match s {
+            "plan" => AgentKind::Plan,
+            _ => AgentKind::Build,
+        }
+    }
+}
 
 // ── Permisos ─────────────────────────────────────────────────────────────────
 
@@ -124,19 +176,29 @@ pub type AgentStream = Pin<Box<dyn Stream<Item = Result<AgentEvent>> + Send>>;
 // ── Motor ──────────────────────────────────────────────────────────────────────
 
 /// El motor: posee el proveedor LLM y el registro de tools; orquesta los turnos.
+///
+/// `provider` es `Arc<dyn Provider>`: el motor no se acopla a un proveedor
+/// concreto. La elección por variable de entorno vive en [`Engine::from_env`].
 #[derive(Clone)]
 pub struct Engine {
-    provider: zhi_provider::DeepSeek,
+    provider: Arc<dyn Provider>,
     tools: ToolRegistry,
 }
 
 impl Engine {
-    /// Construye el motor leyendo la clave de DeepSeek de `DEEPSEEK_API_KEY` y
-    /// registrando las tools integradas.
+    /// Construye el motor eligiendo proveedor según las variables de entorno
+    /// disponibles: `DEEPSEEK_API_KEY` (preferido) u `OPENAI_API_KEY`. Registra
+    /// las tools integradas.
     pub fn from_env() -> Result<Self> {
-        let key = std::env::var("DEEPSEEK_API_KEY").map_err(|_| Error::MissingApiKey)?;
+        let provider: Arc<dyn Provider> = if let Ok(key) = std::env::var("DEEPSEEK_API_KEY") {
+            Arc::new(zhi_provider::OpenAiCompatible::deepseek(key))
+        } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+            Arc::new(zhi_provider::OpenAiCompatible::openai(key))
+        } else {
+            return Err(Error::MissingApiKey);
+        };
         Ok(Self {
-            provider: zhi_provider::DeepSeek::new(key),
+            provider,
             tools: ToolRegistry::with_builtins(),
         })
     }
@@ -145,11 +207,16 @@ impl Engine {
     /// que solicite (resolviendo permisos), reinyecta los resultados y repite
     /// hasta que el modelo cierra el turno. Devuelve el stream de eventos.
     ///
+    /// `agent` controla el system prompt y el conjunto de tools ofrecidas: en
+    /// modo [`AgentKind::Plan`] solo se exponen las de solo lectura, y si el
+    /// modelo pide una tool con efectos igualmente, la ejecución se rechaza.
+    ///
     /// Si se provee `snapshots`, antes de ejecutar las tools de un paso que
     /// requiera permiso, se captura el estado del worktree y se emite un
     /// `AgentEvent::StepSnapshot` para que la UI lo asocie al mensaje del paso.
     pub fn run_turn(
         &self,
+        agent: AgentKind,
         history: Vec<Message>,
         ctx: ToolContext,
         snapshots: Option<Snapshots>,
@@ -159,6 +226,7 @@ impl Engine {
         let registry = self.tools.clone();
         let tool_specs: Vec<zhi_provider::ToolSpec> = registry
             .iter()
+            .filter(|t| agent.allows_writes() || !t.requires_permission())
             .map(|t| {
                 zhi_provider::ToolSpec::function(t.name(), t.description(), t.parameters_schema())
             })
@@ -166,7 +234,7 @@ impl Engine {
 
         let stream = try_stream! {
             let mut messages = Vec::with_capacity(history.len() + 1);
-            messages.push(Message::system(SYSTEM_PROMPT));
+            messages.push(Message::system(agent.system_prompt()));
             messages.extend(history);
             let mut appended: Vec<Message> = Vec::new();
             // Un único snapshot por turno, capturado antes del PRIMER paso con
@@ -245,7 +313,10 @@ impl Engine {
                         .get(&name)
                         .map(|t| t.requires_permission())
                         .unwrap_or(false);
-                    let decision = if needs_permission {
+                    let blocked_by_agent = needs_permission && !agent.allows_writes();
+                    let decision = if blocked_by_agent {
+                        PermissionDecision::Deny
+                    } else if needs_permission {
                         resolver
                             .resolve(PermissionRequest {
                                 tool_name: name.clone(),
@@ -256,7 +327,14 @@ impl Engine {
                         PermissionDecision::Allow
                     };
 
-                    let (output, ok) = if decision == PermissionDecision::Deny {
+                    let (output, ok) = if blocked_by_agent {
+                        (
+                            "Tool con efectos rechazada: el agente está en modo plan \
+                             (solo lectura)."
+                                .to_string(),
+                            false,
+                        )
+                    } else if decision == PermissionDecision::Deny {
                         ("El usuario denegó el permiso para ejecutar esta tool.".to_string(), false)
                     } else {
                         let result = match registry.get(&name) {
