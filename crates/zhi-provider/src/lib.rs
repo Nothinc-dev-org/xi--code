@@ -38,7 +38,10 @@ pub enum Role {
 ///
 /// Un mensaje de asistente puede portar `tool_calls` (peticiones de ejecución de
 /// tools); un mensaje con rol [`Role::Tool`] porta el resultado, correlacionado
-/// por `tool_call_id`.
+/// por `tool_call_id`. Para modelos razonadores compatibles con OpenAI (p.ej.
+/// `deepseek-reasoner`), `reasoning` guarda la *chain of thought* del paso; se
+/// serializa como `reasoning_content`, el campo que DeepSeek exige reenviar en
+/// cada mensaje del asistente del histórico.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Message {
     pub role: Role,
@@ -47,6 +50,8 @@ pub struct Message {
     pub tool_calls: Vec<ToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(rename = "reasoning_content", skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl Message {
@@ -69,6 +74,7 @@ impl Message {
             content: content.into(),
             tool_calls,
             tool_call_id: None,
+            reasoning: None,
         }
     }
 
@@ -79,7 +85,18 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
+            reasoning: None,
         }
+    }
+
+    /// Asocia el *chain of thought* del paso a un mensaje del asistente. Si el
+    /// string es vacío no se almacena (el campo queda `None`).
+    pub fn with_reasoning(mut self, reasoning: impl Into<String>) -> Self {
+        let s = reasoning.into();
+        if !s.is_empty() {
+            self.reasoning = Some(s);
+        }
+        self
     }
 
     fn text(role: Role, content: impl Into<String>) -> Self {
@@ -88,6 +105,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            reasoning: None,
         }
     }
 }
@@ -146,6 +164,9 @@ impl ToolSpec {
 pub enum StreamEvent {
     /// Fragmento incremental de texto del asistente.
     Delta(String),
+    /// Fragmento incremental del *chain of thought* (campo `reasoning_content`
+    /// del SSE estilo OpenAI; lo emiten p.ej. `deepseek-reasoner`).
+    Reasoning(String),
     /// El modelo ha terminado de pedir un conjunto de llamadas a tool.
     ToolCalls(Vec<ToolCall>),
 }
@@ -158,24 +179,57 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 /// detrás de un `Arc<dyn Provider>` para no acoplarse a uno concreto.
 #[async_trait]
 pub trait Provider: Send + Sync {
-    /// Envía la conversación (con las `tools` disponibles) y devuelve un stream
-    /// incremental: texto y, cuando el modelo lo pide, llamadas a tool agregadas.
+    /// Envía la conversación con `model` (con las `tools` disponibles) y devuelve
+    /// un stream incremental: texto y, cuando el modelo lo pide, llamadas a tool
+    /// agregadas. `model` se pasa por turno (mirror del `AgentKind`) para que la
+    /// UI pueda cambiarlo sin reconstruir el proveedor.
     async fn stream_chat(
         &self,
+        model: &str,
         messages: Vec<Message>,
         tools: Vec<ToolSpec>,
     ) -> Result<EventStream>;
+
+    /// Modelo por defecto del proveedor (el que la UI muestra hasta que el
+    /// usuario o una sesión cargada digan otra cosa).
+    fn default_model(&self) -> &str;
+
+    /// Catálogo corto de modelos conocidos del proveedor, para el selector de
+    /// la UI. El primero coincide con [`Provider::default_model`].
+    fn available_models(&self) -> Vec<String>;
+}
+
+/// Modelos conocidos de DeepSeek expuestos en el selector. El primero es el
+/// valor por defecto del cliente `::deepseek(..)`.
+pub const DEEPSEEK_MODELS: &[&str] = &["deepseek-chat", "deepseek-reasoner"];
+
+/// Modelos conocidos de OpenAI expuestos en el selector. El primero es el
+/// valor por defecto del cliente `::openai(..)`.
+pub const OPENAI_MODELS: &[&str] = &["gpt-4o-mini", "gpt-4o"];
+
+/// Modelos que exponen *chain of thought* vía `reasoning_content` en el SSE.
+/// La UI consulta este catálogo para mostrar/ocultar el botón de visibilidad
+/// de pensamientos: si el modelo activo no está aquí, el control no aparece.
+pub const REASONING_MODELS: &[&str] = &["deepseek-reasoner"];
+
+/// `true` si `model` emite *chain of thought* (`reasoning_content`).
+pub fn is_reasoning_model(model: &str) -> bool {
+    REASONING_MODELS.contains(&model)
 }
 
 /// Cliente para cualquier endpoint con API **compatible con OpenAI** (DeepSeek,
 /// OpenAI, Groq, vLLM, Ollama…). El protocolo (`POST /chat/completions`, SSE,
-/// `tool_calls` troceados) es idéntico; lo que cambia son `base_url` y `model`.
+/// `tool_calls` troceados) es idéntico; lo que cambia son `base_url` y el
+/// catálogo de modelos.
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatible {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
-    model: String,
+    /// Catálogo de modelos para el selector de la UI. El primero es el default
+    /// del cliente; para `::new(..)` con endpoints arbitrarios contiene solo
+    /// el modelo pasado.
+    models: Vec<String>,
 }
 
 impl OpenAiCompatible {
@@ -189,18 +243,28 @@ impl OpenAiCompatible {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: base_url.into(),
-            model: model.into(),
+            models: vec![model.into()],
         }
     }
 
     /// Cliente con los valores por defecto de DeepSeek (`deepseek-chat`).
     pub fn deepseek(api_key: impl Into<String>) -> Self {
-        Self::new(api_key, "https://api.deepseek.com", "deepseek-chat")
+        Self {
+            client: reqwest::Client::new(),
+            api_key: api_key.into(),
+            base_url: "https://api.deepseek.com".to_string(),
+            models: DEEPSEEK_MODELS.iter().map(|s| s.to_string()).collect(),
+        }
     }
 
     /// Cliente con los valores por defecto de OpenAI (`gpt-4o-mini`).
     pub fn openai(api_key: impl Into<String>) -> Self {
-        Self::new(api_key, "https://api.openai.com/v1", "gpt-4o-mini")
+        Self {
+            client: reqwest::Client::new(),
+            api_key: api_key.into(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            models: OPENAI_MODELS.iter().map(|s| s.to_string()).collect(),
+        }
     }
 }
 
@@ -208,15 +272,28 @@ impl OpenAiCompatible {
 impl Provider for OpenAiCompatible {
     async fn stream_chat(
         &self,
-        messages: Vec<Message>,
+        model: &str,
+        mut messages: Vec<Message>,
         tools: Vec<ToolSpec>,
     ) -> Result<EventStream> {
+        // DeepSeek exige que todo mensaje de asistente del histórico lleve
+        // `reasoning_content`, aunque sea cadena vacía. Sin esto la API rompe
+        // al reanudar conversaciones con `deepseek-reasoner`. Se aplica solo
+        // cuando el endpoint es DeepSeek para no contaminar otros proveedores.
+        if self.base_url.contains("deepseek") {
+            for msg in &mut messages {
+                if msg.role == Role::Assistant && msg.reasoning.is_none() {
+                    msg.reasoning = Some(String::new());
+                }
+            }
+        }
+
         let response = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
             .bearer_auth(&self.api_key)
             .json(&ChatRequest {
-                model: &self.model,
+                model,
                 messages: &messages,
                 stream: true,
                 tools: if tools.is_empty() { None } else { Some(&tools) },
@@ -253,6 +330,12 @@ impl Provider for OpenAiCompatible {
                         }
                     }
 
+                    if let Some(reasoning) = choice.delta.reasoning_content {
+                        if !reasoning.is_empty() {
+                            yield StreamEvent::Reasoning(reasoning);
+                        }
+                    }
+
                     // Los `tool_calls` llegan troceados; se acumulan por `index`.
                     for tc in choice.delta.tool_calls {
                         let idx = tc.index as usize;
@@ -285,6 +368,14 @@ impl Provider for OpenAiCompatible {
         };
 
         Ok(Box::pin(stream))
+    }
+
+    fn default_model(&self) -> &str {
+        &self.models[0]
+    }
+
+    fn available_models(&self) -> Vec<String> {
+        self.models.clone()
     }
 }
 
@@ -335,6 +426,8 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<DeltaToolCall>,
 }

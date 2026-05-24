@@ -32,6 +32,34 @@ en un runtime Tokio en otros hilos. Por tanto:
 - Los widgets se tocan **solo** desde el hilo de UI, en respuesta a esos mensajes.
 - El stream de tokens del LLM se aplica incrementalmente como mensajes Relm4.
 
+## Render del mensaje del asistente
+
+El cuerpo de la burbuja del asistente es un `gtk::Box` vertical que se rellena
+con bloques heterogéneos:
+
+- **Prosa**: `Label` con markup Pango (negrita, cursiva, headings, listas,
+  inline code) generado a partir del Markdown.
+- **Bloques de código** (fences ```` ``` ````): tarjeta independiente con el
+  lenguaje opcional en cabecera, código monoespaciado seleccionable dentro de
+  un `ScrolledWindow` horizontal y un botón flotante (`gtk::Overlay`) en la
+  esquina inferior derecha que copia el texto crudo al portapapeles.
+
+Durante el streaming, mientras el markdown puede estar a medias, el cuerpo
+muestra un único `Label` con texto plano que se va actualizando con cada
+delta. Al cerrar el segmento (siguiente `ToolStarted` o `TurnFinished`), el
+cuerpo se vacía y se rellena con los bloques renderizados.
+
+El tokenizador vive en `src/markdown.rs` (`parse_blocks`) y consume
+`pulldown-cmark`; los bloques se materializan a widgets en `main.rs`
+(`fill_with_blocks`, `make_code_block`).
+
+## Toast
+
+Un único `gtk::Revealer` montado como `add_overlay` del `gtk::Overlay` raíz,
+con `halign=Center, valign=Start`. Se dispara con `Msg::Toast(text)` y se
+auto-oculta tras un timeout corto; un toast nuevo cancela el timeout previo.
+Hoy lo usa el botón de copiar de los bloques de código ("Texto Copiado").
+
 ## Invariantes
 
 - Cero lógica de negocio aquí: si aparece, va a `zhi-core`.

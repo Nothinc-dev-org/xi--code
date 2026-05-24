@@ -3174,6 +3174,7 @@ dependencies = [
  "libadwaita",
  "pulldown-cmark",
  "relm4",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

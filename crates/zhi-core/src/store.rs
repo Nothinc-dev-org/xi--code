@@ -24,6 +24,9 @@ pub struct SessionMeta {
     pub title: String,
     pub updated_at: String,
     pub agent: AgentKind,
+    /// Modelo elegido para la sesión. `None` en sesiones antiguas o creadas sin
+    /// preferencia: la UI cae al `Engine::default_model` del proveedor activo.
+    pub model: Option<String>,
 }
 
 /// Almacén persistente. Clonable y barato de compartir entre tareas: envuelve un
@@ -98,17 +101,33 @@ impl Store {
         // Perfil del agente activo de la sesión (Fase 4): "build" o "plan".
         // NULL en sesiones antiguas → tratadas como `Build` por defecto.
         self.ensure_column("sessions", "agent").await?;
+        // Modelo elegido para la sesión (Fase 4): nombre tal cual lo entiende
+        // el proveedor. NULL → la UI cae al default del `Engine`.
+        self.ensure_column("sessions", "model").await?;
+        // Chain of thought del paso (Fase 4) tal como lo emite el proveedor
+        // (`reasoning_content` del SSE) y su duración medida en ms. NULL en
+        // mensajes sin reasoning o anteriores a este campo.
+        self.ensure_column("messages", "reasoning").await?;
+        self.ensure_column_typed("messages", "reasoning_ms", "INTEGER")
+            .await?;
         Ok(())
     }
 
     /// Añade una columna `TEXT` a `table` si aún no existe (idempotente).
     async fn ensure_column(&self, table: &str, column: &str) -> crate::Result<()> {
+        self.ensure_column_typed(table, column, "TEXT").await
+    }
+
+    /// Variante de [`Self::ensure_column`] que permite fijar el tipo declarado
+    /// (p. ej. `INTEGER`). SQLite usa afinidad de tipos, así que el tipo es
+    /// orientativo, pero lo mantenemos honesto para los lectores del esquema.
+    async fn ensure_column_typed(&self, table: &str, column: &str, ty: &str) -> crate::Result<()> {
         let cols: Vec<String> =
             sqlx::query_scalar(&format!("SELECT name FROM pragma_table_info('{table}')"))
                 .fetch_all(&self.pool)
                 .await?;
         if !cols.iter().any(|c| c == column) {
-            sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"))
+            sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))
                 .execute(&self.pool)
                 .await?;
         }
@@ -134,41 +153,36 @@ impl Store {
 
     /// Lista las sesiones de un proyecto, de la más reciente a la más antigua.
     pub async fn list_sessions(&self, project_id: i64) -> crate::Result<Vec<SessionMeta>> {
-        let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
-            "SELECT id, title, updated_at, agent FROM sessions
+        let rows = sqlx::query_as::<_, StoredSession>(
+            "SELECT id, title, updated_at, agent, model FROM sessions
              WHERE project_id = ? ORDER BY updated_at DESC, id DESC",
         )
         .bind(project_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(id, title, updated_at, agent)| SessionMeta {
-                id,
-                title,
-                updated_at,
-                agent: agent
-                    .as_deref()
-                    .map(AgentKind::from_str_or_default)
-                    .unwrap_or_default(),
-            })
-            .collect())
+        Ok(rows.into_iter().map(StoredSession::into_meta).collect())
     }
 
-    /// Crea una sesión nueva con el `agent` indicado y devuelve sus metadatos.
+    /// Crea una sesión nueva con el `agent` y `model` indicados y devuelve sus
+    /// metadatos. `model = None` deja la sesión sin preferencia (la UI usará el
+    /// default del `Engine`).
     pub async fn create_session(
         &self,
         project_id: i64,
         title: &str,
         agent: AgentKind,
+        model: Option<&str>,
     ) -> crate::Result<SessionMeta> {
-        let id = sqlx::query("INSERT INTO sessions (project_id, title, agent) VALUES (?, ?, ?)")
-            .bind(project_id)
-            .bind(title)
-            .bind(agent.as_str())
-            .execute(&self.pool)
-            .await?
-            .last_insert_rowid();
+        let id = sqlx::query(
+            "INSERT INTO sessions (project_id, title, agent, model) VALUES (?, ?, ?, ?)",
+        )
+        .bind(project_id)
+        .bind(title)
+        .bind(agent.as_str())
+        .bind(model)
+        .execute(&self.pool)
+        .await?
+        .last_insert_rowid();
         let updated_at =
             sqlx::query_scalar::<_, String>("SELECT updated_at FROM sessions WHERE id = ?")
                 .bind(id)
@@ -179,6 +193,7 @@ impl Store {
             title: title.to_string(),
             updated_at,
             agent,
+            model: model.map(str::to_string),
         })
     }
 
@@ -213,12 +228,23 @@ impl Store {
         Ok(())
     }
 
+    /// Cambia el modelo activo de una sesión (sin tocar `updated_at`: igual que
+    /// `set_session_agent`).
+    pub async fn set_session_model(&self, session_id: i64, model: &str) -> crate::Result<()> {
+        sqlx::query("UPDATE sessions SET model = ? WHERE id = ?")
+            .bind(model)
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Carga el historial de mensajes de una sesión, en orden cronológico,
     /// emparejado con el id de cada fila (la UI lo usa para asociar snapshots
     /// y otros metadatos al mensaje correspondiente).
     pub async fn load_messages(&self, session_id: i64) -> crate::Result<Vec<(i64, Message)>> {
         let rows = sqlx::query_as::<_, StoredMessage>(
-            "SELECT id, role, content, tool_calls, tool_call_id
+            "SELECT id, role, content, tool_calls, tool_call_id, reasoning
              FROM messages WHERE session_id = ? ORDER BY id ASC",
         )
         .bind(session_id)
@@ -233,6 +259,26 @@ impl Store {
             .collect())
     }
 
+    /// Mapa `message_id → duración_ms` del razonamiento del paso, para los
+    /// mensajes de una sesión que registraron uno. La UI lo usa al cargar
+    /// historial para mostrar la duración en las tarjetas colapsadas.
+    pub async fn load_reasoning_durations(
+        &self,
+        session_id: i64,
+    ) -> crate::Result<HashMap<i64, u64>> {
+        let rows: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT id, reasoning_ms FROM messages
+             WHERE session_id = ? AND reasoning_ms IS NOT NULL",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, ms)| (id, ms.max(0) as u64))
+            .collect())
+    }
+
     /// Añade un mensaje (con sus *parts*) a una sesión, refresca `updated_at`
     /// y devuelve el id del mensaje insertado (para asociarle un snapshot).
     pub async fn append_message(&self, session_id: i64, message: &Message) -> crate::Result<i64> {
@@ -242,14 +288,15 @@ impl Store {
             Some(serde_json::to_string(&message.tool_calls).unwrap_or_default())
         };
         let id = sqlx::query(
-            "INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id)
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, reasoning)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(session_id)
         .bind(role_str(message.role))
         .bind(&message.content)
         .bind(tool_calls)
         .bind(&message.tool_call_id)
+        .bind(&message.reasoning)
         .execute(&self.pool)
         .await?
         .last_insert_rowid();
@@ -258,6 +305,18 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(id)
+    }
+
+    /// Asocia la duración (ms) del bloque de razonamiento al mensaje. Se
+    /// guarda aparte de `reasoning` para que la UI pueda mostrarla en la
+    /// tarjeta colapsada tras reabrir la sesión.
+    pub async fn set_message_reasoning_ms(&self, message_id: i64, ms: u64) -> crate::Result<()> {
+        sqlx::query("UPDATE messages SET reasoning_ms = ? WHERE id = ?")
+            .bind(ms as i64)
+            .bind(message_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Asocia un hash de snapshot al mensaje `message_id` (Fase 3c).
@@ -284,6 +343,32 @@ impl Store {
     }
 }
 
+/// Fila cruda de `sessions` antes de mapearse a [`SessionMeta`].
+#[derive(sqlx::FromRow)]
+struct StoredSession {
+    id: i64,
+    title: String,
+    updated_at: String,
+    agent: Option<String>,
+    model: Option<String>,
+}
+
+impl StoredSession {
+    fn into_meta(self) -> SessionMeta {
+        SessionMeta {
+            id: self.id,
+            title: self.title,
+            updated_at: self.updated_at,
+            agent: self
+                .agent
+                .as_deref()
+                .map(AgentKind::from_str_or_default)
+                .unwrap_or_default(),
+            model: self.model,
+        }
+    }
+}
+
 /// Fila cruda de `messages` antes de mapearse al tipo de dominio.
 #[derive(sqlx::FromRow)]
 struct StoredMessage {
@@ -292,6 +377,7 @@ struct StoredMessage {
     content: String,
     tool_calls: Option<String>,
     tool_call_id: Option<String>,
+    reasoning: Option<String>,
 }
 
 impl StoredMessage {
@@ -312,6 +398,7 @@ impl StoredMessage {
             content: self.content,
             tool_calls,
             tool_call_id: self.tool_call_id,
+            reasoning: self.reasoning,
         }
     }
 }
@@ -368,23 +455,35 @@ mod tests {
         assert!(store.list_sessions(project).await.unwrap().is_empty());
 
         let session = store
-            .create_session(project, "Nueva sesión", AgentKind::Build)
+            .create_session(project, "Nueva sesión", AgentKind::Build, None)
             .await
             .unwrap();
         assert_eq!(session.agent, AgentKind::Build);
+        assert_eq!(session.model, None);
 
         store
             .set_session_agent(session.id, AgentKind::Plan)
             .await
             .unwrap();
+        store
+            .set_session_model(session.id, "deepseek-reasoner")
+            .await
+            .unwrap();
         let listed = store.list_sessions(project).await.unwrap();
         assert_eq!(listed.first().map(|s| s.agent), Some(AgentKind::Plan));
+        assert_eq!(
+            listed.first().and_then(|s| s.model.as_deref()),
+            Some("deepseek-reasoner")
+        );
         store
             .append_message(session.id, &Message::user("hola"))
             .await
             .unwrap();
         let assistant_id = store
-            .append_message(session.id, &Message::assistant("¡hola!"))
+            .append_message(
+                session.id,
+                &Message::assistant("¡hola!").with_reasoning("pienso, luego saludo"),
+            )
             .await
             .unwrap();
         store.rename_session(session.id, "Saludo").await.unwrap();
@@ -396,6 +495,13 @@ mod tests {
         let snaps = store.load_snapshots(session.id).await.unwrap();
         assert_eq!(snaps.get(&assistant_id).map(String::as_str), Some("abc123"));
 
+        store
+            .set_message_reasoning_ms(assistant_id, 1234)
+            .await
+            .unwrap();
+        let durations = store.load_reasoning_durations(session.id).await.unwrap();
+        assert_eq!(durations.get(&assistant_id).copied(), Some(1234));
+
         let sessions = store.list_sessions(project).await.unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].title, "Saludo");
@@ -406,6 +512,10 @@ mod tests {
         assert_eq!(messages[0].1.content, "hola");
         assert_eq!(messages[1].1.role, Role::Assistant);
         assert_eq!(messages[1].0, assistant_id);
+        assert_eq!(
+            messages[1].1.reasoning.as_deref(),
+            Some("pienso, luego saludo")
+        );
 
         let _ = std::fs::remove_file(&path);
     }

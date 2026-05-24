@@ -1,43 +1,82 @@
-//! Conversión de Markdown a marcado Pango para renderizar en `gtk::Label`.
+//! Tokeniza un mensaje Markdown en bloques renderizables por la UI.
 //!
-//! Pango solo soporta un subconjunto de formato (negrita, cursiva, monoespaciado…),
-//! así que mapeamos los elementos comunes y descartamos el resto. El texto se
-//! escapa siempre para no romper el marcado.
+//! Los bloques de código se entregan en crudo (con su lenguaje opcional)
+//! para que la vista los pinte como widgets propios con botón de copiar.
+//! El resto se devuelve como prosa en marcado Pango ya escapado.
 
-use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 use relm4::gtk::glib;
 
-/// Convierte una cadena Markdown en marcado Pango seguro.
-pub fn to_pango(markdown: &str) -> String {
-    let mut out = String::new();
+pub enum Block {
+    /// Texto convertido a marcado Pango. Apto para `Label::set_markup`.
+    Prose(String),
+    /// Bloque de código con su lenguaje (si la cerca lo declaró) y su texto literal.
+    Code { lang: Option<String>, text: String },
+}
+
+pub fn parse_blocks(markdown: &str) -> Vec<Block> {
+    let mut out: Vec<Block> = Vec::new();
+    let mut prose = String::new();
+    let mut code: Option<(Option<String>, String)> = None;
+
+    let flush_prose = |prose: &mut String, out: &mut Vec<Block>| {
+        let trimmed = prose.trim_end();
+        if !trimmed.is_empty() {
+            out.push(Block::Prose(trimmed.to_string()));
+        }
+        prose.clear();
+    };
 
     for event in Parser::new(markdown) {
-        match event {
-            Event::Start(Tag::Strong) => out.push_str("<b>"),
-            Event::Start(Tag::Emphasis) => out.push_str("<i>"),
-            Event::Start(Tag::Heading { .. }) => out.push_str("<b>"),
-            Event::Start(Tag::CodeBlock(_)) => out.push_str("<tt>"),
-            Event::Start(Tag::Item) => out.push_str("• "),
-
-            Event::End(TagEnd::Strong) => out.push_str("</b>"),
-            Event::End(TagEnd::Emphasis) => out.push_str("</i>"),
-            Event::End(TagEnd::Heading(_)) => out.push_str("</b>\n"),
-            Event::End(TagEnd::CodeBlock) => out.push_str("</tt>\n"),
-            Event::End(TagEnd::Paragraph) => out.push_str("\n\n"),
-            Event::End(TagEnd::Item) => out.push('\n'),
-
-            Event::Text(text) => out.push_str(glib::markup_escape_text(&text).as_str()),
-            Event::Code(code) => {
-                out.push_str("<tt>");
-                out.push_str(glib::markup_escape_text(&code).as_str());
-                out.push_str("</tt>");
+        if let Some((_, buf)) = code.as_mut() {
+            match event {
+                Event::Text(t) => buf.push_str(&t),
+                Event::End(TagEnd::CodeBlock) => {
+                    let (lang, mut text) = code.take().unwrap();
+                    if text.ends_with('\n') {
+                        text.pop();
+                    }
+                    out.push(Block::Code { lang, text });
+                }
+                _ => {}
             }
-            Event::SoftBreak => out.push(' '),
-            Event::HardBreak => out.push('\n'),
+            continue;
+        }
+
+        match event {
+            Event::Start(Tag::CodeBlock(kind)) => {
+                flush_prose(&mut prose, &mut out);
+                let lang = match kind {
+                    CodeBlockKind::Fenced(l) if !l.is_empty() => Some(l.into_string()),
+                    _ => None,
+                };
+                code = Some((lang, String::new()));
+            }
+
+            Event::Start(Tag::Strong) => prose.push_str("<b>"),
+            Event::Start(Tag::Emphasis) => prose.push_str("<i>"),
+            Event::Start(Tag::Heading { .. }) => prose.push_str("<b>"),
+            Event::Start(Tag::Item) => prose.push_str("• "),
+
+            Event::End(TagEnd::Strong) => prose.push_str("</b>"),
+            Event::End(TagEnd::Emphasis) => prose.push_str("</i>"),
+            Event::End(TagEnd::Heading(_)) => prose.push_str("</b>\n"),
+            Event::End(TagEnd::Paragraph) => prose.push_str("\n\n"),
+            Event::End(TagEnd::Item) => prose.push('\n'),
+
+            Event::Text(text) => prose.push_str(glib::markup_escape_text(&text).as_str()),
+            Event::Code(code) => {
+                prose.push_str("<tt>");
+                prose.push_str(glib::markup_escape_text(&code).as_str());
+                prose.push_str("</tt>");
+            }
+            Event::SoftBreak => prose.push(' '),
+            Event::HardBreak => prose.push('\n'),
 
             _ => {}
         }
     }
 
-    out.trim_end().to_string()
+    flush_prose(&mut prose, &mut out);
+    out
 }

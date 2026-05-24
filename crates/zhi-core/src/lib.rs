@@ -22,7 +22,9 @@ use futures::{Stream, StreamExt};
 
 pub use snapshot::Snapshots;
 pub use store::{SessionMeta, Store};
-pub use zhi_provider::{EventStream, Message, Provider, Role, StreamEvent, ToolCall};
+pub use zhi_provider::{
+    is_reasoning_model, EventStream, Message, Provider, Role, StreamEvent, ToolCall,
+};
 pub use zhi_tool::{ToolContext, ToolRegistry};
 
 /// Error del crate. Agrega los errores de los subsistemas del motor.
@@ -153,6 +155,13 @@ impl PermissionResolver for AllowAll {
 pub enum AgentEvent {
     /// Fragmento incremental de texto del asistente.
     Delta(String),
+    /// Fragmento incremental del *chain of thought* del paso (`reasoning_content`
+    /// del SSE; emitido p. ej. por `deepseek-reasoner`).
+    ReasoningDelta(String),
+    /// Cierre del bloque de razonamiento del paso, con la duración medida desde
+    /// el primer `ReasoningDelta`. La UI lo usa para colapsar la tarjeta y
+    /// mostrar la duración. Solo se emite si hubo al menos un delta.
+    ReasoningFinished { duration_ms: u64 },
     /// Snapshot del worktree tomado antes de ejecutar las tools con efectos del
     /// paso actual. `message_index` apunta al mensaje del asistente con las
     /// `tool_calls` dentro del `Vec<Message>` que vendrá en `Turn(..)`.
@@ -203,6 +212,17 @@ impl Engine {
         })
     }
 
+    /// Modelo por defecto del proveedor activo. La UI lo usa como valor inicial
+    /// del selector cuando una sesión no tiene modelo persistido.
+    pub fn default_model(&self) -> String {
+        self.provider.default_model().to_string()
+    }
+
+    /// Catálogo de modelos del proveedor activo para el selector de la UI.
+    pub fn available_models(&self) -> Vec<String> {
+        self.provider.available_models()
+    }
+
     /// Ejecuta un turno completo del agente: llama al proveedor, ejecuta las tools
     /// que solicite (resolviendo permisos), reinyecta los resultados y repite
     /// hasta que el modelo cierra el turno. Devuelve el stream de eventos.
@@ -210,6 +230,8 @@ impl Engine {
     /// `agent` controla el system prompt y el conjunto de tools ofrecidas: en
     /// modo [`AgentKind::Plan`] solo se exponen las de solo lectura, y si el
     /// modelo pide una tool con efectos igualmente, la ejecución se rechaza.
+    /// `model` se pasa al proveedor por turno (mirror del `agent`); persiste por
+    /// sesión en `sessions.model`.
     ///
     /// Si se provee `snapshots`, antes de ejecutar las tools de un paso que
     /// requiera permiso, se captura el estado del worktree y se emite un
@@ -217,6 +239,7 @@ impl Engine {
     pub fn run_turn(
         &self,
         agent: AgentKind,
+        model: String,
         history: Vec<Message>,
         ctx: ToolContext,
         snapshots: Option<Snapshots>,
@@ -244,23 +267,60 @@ impl Engine {
             let mut snapshot_taken = false;
 
             for _ in 0..MAX_STEPS {
-                let mut inner = provider.stream_chat(messages.clone(), tool_specs.clone()).await?;
+                let mut inner = provider
+                    .stream_chat(&model, messages.clone(), tool_specs.clone())
+                    .await?;
                 let mut text = String::new();
+                let mut reasoning = String::new();
+                // Mide la duración del bloque de razonamiento del paso. El reloj
+                // arranca con el primer `Reasoning` y se cierra al observar el
+                // primer `Delta`/`ToolCalls` o al final del step. Solo se emite
+                // `ReasoningFinished` si hubo al menos un delta de reasoning.
+                let mut reasoning_started_at: Option<std::time::Instant> = None;
+                let mut reasoning_closed = false;
                 let mut calls: Vec<ToolCall> = Vec::new();
 
                 while let Some(event) = inner.next().await {
                     match event? {
                         StreamEvent::Delta(d) => {
+                            if let (Some(start), false) = (reasoning_started_at, reasoning_closed) {
+                                let ms = start.elapsed().as_millis() as u64;
+                                yield AgentEvent::ReasoningFinished { duration_ms: ms };
+                                reasoning_closed = true;
+                            }
                             text.push_str(&d);
                             yield AgentEvent::Delta(d);
                         }
-                        StreamEvent::ToolCalls(c) => calls = c,
+                        StreamEvent::Reasoning(r) => {
+                            if reasoning_started_at.is_none() {
+                                reasoning_started_at = Some(std::time::Instant::now());
+                            }
+                            reasoning.push_str(&r);
+                            yield AgentEvent::ReasoningDelta(r);
+                        }
+                        StreamEvent::ToolCalls(c) => {
+                            if let (Some(start), false) =
+                                (reasoning_started_at, reasoning_closed)
+                            {
+                                let ms = start.elapsed().as_millis() as u64;
+                                yield AgentEvent::ReasoningFinished { duration_ms: ms };
+                                reasoning_closed = true;
+                            }
+                            calls = c;
+                        }
                     }
+                }
+
+                // Cierre por fin de stream sin haber visto content/tool_calls
+                // (raro, pero defensivo: garantiza que la UI cierra el spinner).
+                if let (Some(start), false) = (reasoning_started_at, reasoning_closed) {
+                    let ms = start.elapsed().as_millis() as u64;
+                    yield AgentEvent::ReasoningFinished { duration_ms: ms };
                 }
 
                 if calls.is_empty() {
                     if !text.is_empty() {
-                        let msg = Message::assistant(text);
+                        let msg = Message::assistant(text).with_reasoning(reasoning);
                         messages.push(msg.clone());
                         appended.push(msg);
                     }
@@ -268,7 +328,8 @@ impl Engine {
                 }
 
                 // El asistente solicita tools: se registra el mensaje con las calls.
-                let assistant_msg = Message::assistant_tool_calls(text, calls.clone());
+                let assistant_msg =
+                    Message::assistant_tool_calls(text, calls.clone()).with_reasoning(reasoning);
                 messages.push(assistant_msg.clone());
                 appended.push(assistant_msg);
                 let assistant_index = appended.len() - 1;

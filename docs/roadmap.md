@@ -19,7 +19,10 @@ fases incrementales; cada fase deja la app utilizable.
 - [x] `zhi-provider`: proveedor **DeepSeek** con streaming SSE
       (compatible con OpenAI). Ver [ADR-0005](decisions/0005-proveedor-deepseek.md).
 - [x] `zhi-core`: `Session` (historial en memoria) y `Engine::stream_turn`.
-- [x] `zhi-gtk`: vista de chat, envío de mensaje, render de Markdown del turno.
+- [x] `zhi-gtk`: vista de chat, envío de mensaje, render de Markdown del turno
+      (prosa en Pango + tarjetas de bloque de código con botón de copiar y
+      toast "Texto Copiado" centro-arriba). Detalle en
+      [`crates/zhi-gtk/AGENTS.md`](../crates/zhi-gtk/AGENTS.md).
 - [x] Puente Tokio ↔ GLib (`relm4::spawn` + `sender.input`); la UI no bloquea.
 
 > Verificado: `fmt`, `clippy -D warnings`, `test` y build del binario en verde.
