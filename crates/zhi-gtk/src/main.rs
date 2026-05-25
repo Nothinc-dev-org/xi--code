@@ -21,7 +21,7 @@ use relm4::{adw, gtk, Component, ComponentParts, ComponentSender, RelmApp, RelmW
 use zhi_core::{
     is_reasoning_model, AgentEvent, AgentKind, Engine, Message, PermissionDecision,
     PermissionRequest, PermissionResolver, Role, Session, SessionMeta, Snapshots, Store,
-    ToolContext,
+    ToolContext, PROVIDERS,
 };
 
 const APP_ID: &str = "ai.xiecode.App";
@@ -29,8 +29,9 @@ const APP_ID: &str = "ai.xiecode.App";
 const TOOL_OUTPUT_MAX: usize = 4000;
 
 struct App {
-    /// `None` si no se pudo inicializar el motor (p. ej. falta la API key).
-    engine: Option<Engine>,
+    /// Motor del agente. Existe siempre: la falta de credenciales se reporta al
+    /// ejecutar un turno, no al arrancar (ver [ADR-0008]).
+    engine: Engine,
     /// `None` si no se pudo abrir la base de datos.
     store: Option<Store>,
     /// Snapshots del worktree (Fase 3c). `None` hasta `SnapshotsReady`, o
@@ -49,7 +50,7 @@ struct App {
     current_agent: AgentKind,
     /// Modelo activo en la sesión actual. Persistido por sesión (igual que el
     /// agente); las nuevas heredan el valor activo en el momento de su creación.
-    /// Vacío si el motor no está disponible (no hay default del que partir).
+    /// Arranca con `zhi_provider::default_model()`.
     current_model: String,
     /// Historial en memoria de la sesión activa.
     session: Session,
@@ -466,11 +467,8 @@ impl Component for App {
 
         let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        let engine = Engine::from_env().ok();
-        let current_model = engine
-            .as_ref()
-            .map(Engine::default_model)
-            .unwrap_or_default();
+        let engine = Engine::new();
+        let current_model = zhi_core::default_model().to_string();
         let model = App {
             engine,
             store: store.clone(),
@@ -520,12 +518,17 @@ impl Component for App {
             widgets.entry.add_controller(controller);
         }
 
-        if model.engine.is_none() {
+        if !any_provider_key_present() {
+            let vars: Vec<&'static str> = PROVIDERS.iter().map(|p| p.env_var).collect();
             append_bubble(
                 &widgets.chat_list,
                 Role::System,
-                "Falta una clave de proveedor en el entorno. Exporta DEEPSEEK_API_KEY \
-                 (preferido) u OPENAI_API_KEY y reinicia la app.",
+                &format!(
+                    "No hay ninguna clave de proveedor en el entorno ({}). Puedes elegir \
+                     modelo de todos modos; al enviar un mensaje, la app te dirá qué \
+                     variable falta.",
+                    vars.join(", ")
+                ),
             );
         }
 
@@ -614,8 +617,7 @@ impl Component for App {
                 self.current_model = meta
                     .model
                     .clone()
-                    .or_else(|| self.engine.as_ref().map(Engine::default_model))
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| zhi_core::default_model().to_string());
                 self.streaming_bubble = None;
                 self.tool_output = None;
                 self.tool_card = None;
@@ -793,15 +795,7 @@ impl Component for App {
             }
 
             Msg::OpenModelPicker => {
-                let Some(engine) = self.engine.as_ref() else {
-                    tracing::warn!("modelo: sin engine (¿falta DEEPSEEK_API_KEY/OPENAI_API_KEY?)");
-                    return;
-                };
-                let options = engine.available_models();
-                if options.is_empty() {
-                    tracing::warn!("modelo: el proveedor no expone modelos");
-                    return;
-                }
+                let options = catalog_model_options();
                 tracing::debug!(current = %self.current_model, count = options.len(), "modelo: abriendo selector");
                 let current = self.current_model.clone();
                 let sender_dialog = sender.clone();
@@ -849,9 +843,7 @@ impl Component for App {
             }
 
             Msg::Send(text) => {
-                let Some(engine) = self.engine.clone() else {
-                    return;
-                };
+                let engine = self.engine.clone();
                 let (Some(store), Some(session_id)) = (self.store.clone(), self.current_session)
                 else {
                     return;
@@ -1207,13 +1199,14 @@ async fn bootstrap(store: &Store, project_path: &str) -> zhi_core::Result<(i64, 
     Ok((project_id, sessions))
 }
 
-/// Habilita/inhabilita el envío según haya motor, sesión y no estemos ocupados,
-/// y refleja el agente activo en los toggles (sin disparar el handler: el
+/// Habilita/inhabilita el envío según haya sesión y no estemos ocupados, y
+/// refleja el agente activo en los toggles (sin disparar el handler: el
 /// `AgentChanged` neutraliza el eco comparando con `current_agent`). El botón
-/// de modelo muestra el modelo activo; queda deshabilitado durante un turno o
-/// si no hay motor.
+/// de modelo muestra el modelo activo y solo se inhabilita durante un turno:
+/// puede abrirse aunque no haya clave de proveedor en el entorno (la falta se
+/// reporta al enviar; ver [ADR-0008]).
 fn update_controls(model: &App, widgets: &AppWidgets) {
-    let ready = model.engine.is_some() && model.current_session.is_some() && !model.busy;
+    let ready = model.current_session.is_some() && !model.busy;
     widgets.entry.set_sensitive(ready);
     widgets.send_button.set_sensitive(ready);
 
@@ -1231,9 +1224,7 @@ fn update_controls(model: &App, widgets: &AppWidgets) {
         model.current_model.as_str()
     };
     widgets.model_button.set_label(model_label);
-    widgets
-        .model_button
-        .set_sensitive(model.engine.is_some() && !model.busy);
+    widgets.model_button.set_sensitive(!model.busy);
 
     // Botón ojo: solo visible si el modelo activo es razonador. El estado e
     // ícono reflejan el toggle global. `block_signal`/`unblock_signal` no es
@@ -1803,13 +1794,47 @@ fn show_revert_dialog(
     dialog.present();
 }
 
-/// Modal de selección de modelo. Lista los modelos disponibles como un grupo
+/// Una opción del picker de modelos: `value` es el id que persistimos y se
+/// envía al motor; `label` es la cadena visible (incluye el proveedor y, si
+/// procede, un aviso de clave faltante).
+struct ModelOption {
+    value: String,
+    label: String,
+}
+
+/// Construye la lista plana de modelos del catálogo agrupados por proveedor,
+/// anotando los que carecen de su variable de entorno.
+fn catalog_model_options() -> Vec<ModelOption> {
+    PROVIDERS
+        .iter()
+        .flat_map(|p| {
+            let has_key = std::env::var_os(p.env_var).is_some();
+            p.models.iter().map(move |&m| ModelOption {
+                value: m.to_string(),
+                label: if has_key {
+                    format!("{m}  ·  {}", p.name)
+                } else {
+                    format!("{m}  ·  {} (falta {})", p.name, p.env_var)
+                },
+            })
+        })
+        .collect()
+}
+
+/// `true` si al menos una de las variables de entorno del catálogo está puesta.
+fn any_provider_key_present() -> bool {
+    PROVIDERS
+        .iter()
+        .any(|p| std::env::var_os(p.env_var).is_some())
+}
+
+/// Modal de selección de modelo. Lista los modelos del catálogo como un grupo
 /// radio (un único `CheckButton` `set_group`-ado); al confirmar invoca
-/// `on_select(modelo)`. Si el usuario cancela, no se invoca nada.
+/// `on_select(modelID)` con el id puro. Si el usuario cancela, no se invoca nada.
 fn show_model_picker_dialog(
     parent: &adw::ApplicationWindow,
     current: &str,
-    options: &[String],
+    options: &[ModelOption],
     on_select: impl Fn(String) + 'static,
 ) {
     let dialog = adw::MessageDialog::new(Some(parent), Some("Modelo"), None);
@@ -1823,11 +1848,11 @@ fn show_model_picker_dialog(
     list.set_margin_top(8);
 
     let selected = Rc::new(Cell::new(
-        options.iter().position(|m| m == current).unwrap_or(0),
+        options.iter().position(|o| o.value == current).unwrap_or(0),
     ));
     let mut group: Option<gtk::CheckButton> = None;
-    for (idx, name) in options.iter().enumerate() {
-        let radio = gtk::CheckButton::with_label(name);
+    for (idx, option) in options.iter().enumerate() {
+        let radio = gtk::CheckButton::with_label(&option.label);
         if let Some(first) = &group {
             radio.set_group(Some(first));
         } else {
@@ -1846,12 +1871,12 @@ fn show_model_picker_dialog(
     }
     dialog.set_extra_child(Some(&list));
 
-    let options = options.to_vec();
+    let values: Vec<String> = options.iter().map(|o| o.value.clone()).collect();
     dialog.connect_response(None, move |_, response| {
         if response != "apply" {
             return;
         }
-        if let Some(chosen) = options.get(selected.get()) {
+        if let Some(chosen) = values.get(selected.get()) {
             on_select(chosen.clone());
         }
     });

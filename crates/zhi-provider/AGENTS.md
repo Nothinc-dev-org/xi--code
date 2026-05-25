@@ -1,15 +1,17 @@
 # AGENTS.md — zhi-provider
 
-> Implementado: trait `Provider` (Fase 4) y un único cliente
+> Implementado: trait `Provider` (un método `stream_chat`), cliente único
 > `OpenAiCompatible` que cubre cualquier endpoint con API estilo OpenAI
-> (DeepSeek, OpenAI, Groq, vLLM, Ollama, …) — `::deepseek(key)` /
-> `::openai(key)` para los dos defaults; `::new(key, base_url, model)` para
-> compatibles arbitrarios. Streaming SSE (Fase 1) y *function calling*
-> —`tools` en la petición, agregación de `tool_calls` del stream— (Fase 3).
-> `zhi-core::Engine` posee `Arc<dyn Provider>` y elige proveedor en
-> `from_env` según `DEEPSEEK_API_KEY` u `OPENAI_API_KEY`. Pendiente:
-> selector de modelo en la UI, otros formatos no-OpenAI (Anthropic) si
-> entran.
+> (DeepSeek, OpenAI, Groq, vLLM, Ollama, …) — `::new(key, base_url)` para
+> endpoints arbitrarios y `::from_spec(spec, key)` para los del catálogo.
+> Streaming SSE (Fase 1), *function calling* —`tools` en la petición,
+> agregación de `tool_calls` del stream— (Fase 3) y *chain of thought*
+> (`reasoning_content`) en el stream. **Catálogo estático multi-proveedor**
+> (`PROVIDERS: &[ProviderSpec]`, `default_model()`, `find_provider_for_model`)
+> que vive aquí: el catálogo es navegable sin instanciar nada ni leer claves;
+> la selección del modelo no depende de qué proveedor esté instanciado. Ver
+> [ADR-0008](../../docs/decisions/0008-multi-proveedor-catalogo-estatico.md).
+> Pendiente: otros formatos no-OpenAI (Anthropic) si entran.
 > Lee `/AGENTS.md` y `docs/architecture.md` antes de tocarlo.
 
 ## Responsabilidad

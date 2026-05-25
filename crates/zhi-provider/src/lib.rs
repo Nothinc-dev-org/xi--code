@@ -175,37 +175,72 @@ pub enum StreamEvent {
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 
 /// Abstracción común de un proveedor de LLM. Los proveedores concretos
-/// (DeepSeek, OpenAI, …) implementan este trait; `zhi-core::Engine` lo posee
-/// detrás de un `Arc<dyn Provider>` para no acoplarse a uno concreto.
+/// (DeepSeek, OpenAI, …) implementan este trait; `zhi-core::Engine` resuelve la
+/// instancia adecuada por modelo a partir del catálogo estático [`PROVIDERS`].
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Envía la conversación con `model` (con las `tools` disponibles) y devuelve
     /// un stream incremental: texto y, cuando el modelo lo pide, llamadas a tool
-    /// agregadas. `model` se pasa por turno (mirror del `AgentKind`) para que la
-    /// UI pueda cambiarlo sin reconstruir el proveedor.
+    /// agregadas. `model` se pasa por turno para que la UI pueda cambiarlo sin
+    /// reconstruir el proveedor.
     async fn stream_chat(
         &self,
         model: &str,
         messages: Vec<Message>,
         tools: Vec<ToolSpec>,
     ) -> Result<EventStream>;
-
-    /// Modelo por defecto del proveedor (el que la UI muestra hasta que el
-    /// usuario o una sesión cargada digan otra cosa).
-    fn default_model(&self) -> &str;
-
-    /// Catálogo corto de modelos conocidos del proveedor, para el selector de
-    /// la UI. El primero coincide con [`Provider::default_model`].
-    fn available_models(&self) -> Vec<String>;
 }
 
-/// Modelos conocidos de DeepSeek expuestos en el selector. El primero es el
-/// valor por defecto del cliente `::deepseek(..)`.
+/// Descripción estática de un proveedor LLM conocido por la app: su id estable,
+/// el nombre visible, la URL base de su API estilo OpenAI, la variable de
+/// entorno donde se busca la clave y el catálogo de modelos.
+///
+/// El catálogo de modelos se expone a la UI sin instanciar ningún cliente y sin
+/// requerir credenciales: el botón de modelo siempre es navegable.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderSpec {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub base_url: &'static str,
+    pub env_var: &'static str,
+    pub models: &'static [&'static str],
+}
+
+/// Modelos conocidos de DeepSeek expuestos en el selector.
 pub const DEEPSEEK_MODELS: &[&str] = &["deepseek-chat", "deepseek-reasoner"];
 
-/// Modelos conocidos de OpenAI expuestos en el selector. El primero es el
-/// valor por defecto del cliente `::openai(..)`.
+/// Modelos conocidos de OpenAI expuestos en el selector.
 pub const OPENAI_MODELS: &[&str] = &["gpt-4o-mini", "gpt-4o"];
+
+/// Catálogo de proveedores conocidos. El orden define la prioridad para
+/// resolver el modelo por defecto y para presentarlos en la UI.
+pub const PROVIDERS: &[ProviderSpec] = &[
+    ProviderSpec {
+        id: "deepseek",
+        name: "DeepSeek",
+        base_url: "https://api.deepseek.com",
+        env_var: "DEEPSEEK_API_KEY",
+        models: DEEPSEEK_MODELS,
+    },
+    ProviderSpec {
+        id: "openai",
+        name: "OpenAI",
+        base_url: "https://api.openai.com/v1",
+        env_var: "OPENAI_API_KEY",
+        models: OPENAI_MODELS,
+    },
+];
+
+/// Modelo por defecto del catálogo (primer modelo del primer proveedor).
+pub fn default_model() -> &'static str {
+    PROVIDERS[0].models[0]
+}
+
+/// Busca el proveedor cuyo catálogo contiene `model_id`. Devuelve el primero
+/// que coincida; el catálogo está cerrado y no hay solapamientos.
+pub fn find_provider_for_model(model_id: &str) -> Option<&'static ProviderSpec> {
+    PROVIDERS.iter().find(|p| p.models.contains(&model_id))
+}
 
 /// Modelos que exponen *chain of thought* vía `reasoning_content` en el SSE.
 /// La UI consulta este catálogo para mostrar/ocultar el botón de visibilidad
@@ -219,52 +254,30 @@ pub fn is_reasoning_model(model: &str) -> bool {
 
 /// Cliente para cualquier endpoint con API **compatible con OpenAI** (DeepSeek,
 /// OpenAI, Groq, vLLM, Ollama…). El protocolo (`POST /chat/completions`, SSE,
-/// `tool_calls` troceados) es idéntico; lo que cambia son `base_url` y el
-/// catálogo de modelos.
+/// `tool_calls` troceados) es idéntico; lo que cambia es la `base_url`.
+///
+/// El modelo no se fija aquí: viaja por turno en [`Provider::stream_chat`]
+/// (el catálogo vive en [`PROVIDERS`]).
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatible {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
-    /// Catálogo de modelos para el selector de la UI. El primero es el default
-    /// del cliente; para `::new(..)` con endpoints arbitrarios contiene solo
-    /// el modelo pasado.
-    models: Vec<String>,
 }
 
 impl OpenAiCompatible {
     /// Cliente genérico para cualquier endpoint compatible con OpenAI.
-    pub fn new(
-        api_key: impl Into<String>,
-        base_url: impl Into<String>,
-        model: impl Into<String>,
-    ) -> Self {
+    pub fn new(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: base_url.into(),
-            models: vec![model.into()],
         }
     }
 
-    /// Cliente con los valores por defecto de DeepSeek (`deepseek-chat`).
-    pub fn deepseek(api_key: impl Into<String>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            api_key: api_key.into(),
-            base_url: "https://api.deepseek.com".to_string(),
-            models: DEEPSEEK_MODELS.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
-    /// Cliente con los valores por defecto de OpenAI (`gpt-4o-mini`).
-    pub fn openai(api_key: impl Into<String>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            api_key: api_key.into(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            models: OPENAI_MODELS.iter().map(|s| s.to_string()).collect(),
-        }
+    /// Construye el cliente a partir de una entrada del catálogo y su clave.
+    pub fn from_spec(spec: &ProviderSpec, api_key: impl Into<String>) -> Self {
+        Self::new(api_key, spec.base_url)
     }
 }
 
@@ -369,14 +382,6 @@ impl Provider for OpenAiCompatible {
 
         Ok(Box::pin(stream))
     }
-
-    fn default_model(&self) -> &str {
-        &self.models[0]
-    }
-
-    fn available_models(&self) -> Vec<String> {
-        self.models.clone()
-    }
 }
 
 /// Acumulador de una llamada a tool mientras llega troceada por el stream.
@@ -447,4 +452,28 @@ struct DeltaFunction {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_is_coherent() {
+        // El default debe pertenecer a algún proveedor del catálogo.
+        assert!(find_provider_for_model(default_model()).is_some());
+        // Cada modelo del catálogo debe ser resoluble a su `ProviderSpec`.
+        for spec in PROVIDERS {
+            assert!(!spec.models.is_empty(), "{} sin modelos", spec.id);
+            for model in spec.models {
+                let resolved = find_provider_for_model(model).expect("modelo del catálogo");
+                assert_eq!(resolved.id, spec.id);
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_model_is_not_resolvable() {
+        assert!(find_provider_for_model("modelo-inexistente").is_none());
+    }
 }

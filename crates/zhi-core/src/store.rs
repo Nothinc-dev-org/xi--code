@@ -25,7 +25,7 @@ pub struct SessionMeta {
     pub updated_at: String,
     pub agent: AgentKind,
     /// Modelo elegido para la sesión. `None` en sesiones antiguas o creadas sin
-    /// preferencia: la UI cae al `Engine::default_model` del proveedor activo.
+    /// preferencia: la UI cae a `zhi_provider::default_model()`.
     pub model: Option<String>,
 }
 

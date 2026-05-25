@@ -78,10 +78,22 @@ Ver [ADR-0007](decisions/0007-tools-permisos-bucle-agente.md).
       entrada; atajo `Shift+Tab` desde el campo para alternar.
       Deshabilitado durante un turno.
 - [ ] Subagentes para tareas multi-paso.
-- [x] Trait `Provider` extraído (`zhi-core::Engine` posee `Arc<dyn Provider>`);
-      cliente único `OpenAiCompatible` cubriendo DeepSeek, OpenAI y cualquier
-      endpoint compatible; `Engine::from_env` elige por `DEEPSEEK_API_KEY` /
-      `OPENAI_API_KEY`. Pendiente del ítem: selector de modelo en la UI.
+- [x] Trait `Provider` (solo `stream_chat`) y cliente único `OpenAiCompatible`
+      cubriendo DeepSeek, OpenAI y cualquier endpoint compatible.
+- [x] **Catálogo estático multi-proveedor** (`PROVIDERS` + `ProviderSpec`) en
+      `zhi-provider`. `Engine::new` es infalible: construye una caché perezosa
+      de clientes y los instancia al resolver el modelo del turno; si falta la
+      clave del proveedor del modelo, emite `Error::MissingApiKey { env_var,
+      model }`. Ver [ADR-0008](decisions/0008-multi-proveedor-catalogo-estatico.md).
+- [x] Selector de modelo en la UI (`OpenModelPicker`/`ModelChanged`), modelo
+      por turno en `Engine::run_turn` y `Provider::stream_chat`, persistido por
+      sesión. El picker se alimenta del catálogo completo (todos los
+      proveedores conocidos) y marca los modelos cuya clave no está exportada;
+      el botón solo se inhabilita durante un turno.
+- [x] Razonamiento (chain of thought) en streaming: `ReasoningDelta` /
+      `ReasoningFinished` en `AgentEvent`, tarjetas colapsables con spinner y
+      duración, toggle global. Columnas `reasoning` / `reasoning_ms` en
+      `sessions` y `messages` (migración idempotente vía `ensure_column_typed`).
 - [ ] Agentes personalizados desde config.
 
 ## Fase 5 — MCP y LSP

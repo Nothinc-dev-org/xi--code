@@ -29,6 +29,10 @@ lo que ya está en `docs/`; esto son punteros y estado.
   function calling en `zhi-provider`, `Engine::run_turn`, permisos vía
   `PermissionResolver` + `oneshot`, parts en `messages` con columnas idempotentes.
   → [ADR-0007](../docs/decisions/0007-tools-permisos-bucle-agente.md)
+- Catálogo estático de proveedores en `zhi-provider` (`PROVIDERS` /
+  `ProviderSpec`); `Engine` infalible con caché perezosa de clientes y
+  resolución modelo→proveedor por turno. La falta de clave es un error del
+  turno, no del arranque. → [ADR-0008](../docs/decisions/0008-multi-proveedor-catalogo-estatico.md)
 
 ## Estado actual
 
@@ -67,11 +71,14 @@ lo que ya está en `docs/`; esto son punteros y estado.
 - **Render Markdown**: durante el stream se muestra texto plano (`set_text`); al
   terminar el turno se convierte a marcado Pango (`markdown::to_pango` con
   `pulldown-cmark`) y se aplica con `set_markup`, para evitar markup a medias.
-- **Proveedor LLM**: trait `Provider` en `zhi-provider`; un único cliente
-  `OpenAiCompatible` con constructores `::deepseek(key)`, `::openai(key)` y
-  `::new(key, base_url, model)` cubre cualquier endpoint estilo OpenAI.
-  `Engine::from_env` elige entre `DEEPSEEK_API_KEY` (preferido) u
-  `OPENAI_API_KEY`. `Engine` posee `Arc<dyn Provider>`.
+- **Proveedor LLM**: trait `Provider` en `zhi-provider` (un método:
+  `stream_chat`). Catálogo `PROVIDERS` con un `ProviderSpec` por endpoint
+  conocido (DeepSeek, OpenAI) — id, nombre, base_url, env_var y modelos.
+  `find_provider_for_model(id)` resuelve el `ProviderSpec`. El cliente
+  `OpenAiCompatible::from_spec(spec, key)` cubre cualquier endpoint estilo
+  OpenAI. `Engine::new` es infalible y cachea perezosamente los clientes por
+  proveedor; `Error::MissingApiKey { env_var, model }` se emite **en el turno**
+  si la variable del proveedor del modelo no está definida.
 - **Agentes**: `AgentKind` (`Build`/`Plan`) en `zhi-core` determina el system
   prompt y filtra las tools que se exponen al modelo (`Plan` solo lectura).
   `Engine::run_turn(agent, ...)`. Persistido en `sessions.agent`. Selector

@@ -38,8 +38,10 @@ El trait común se extraerá en la Fase 4, cuando entre el segundo proveedor.
   `OpenAiCompatible` con constructores `::deepseek(key)`, `::openai(key)` y
   `::new(key, base_url, model)` para cualquier endpoint compatible. DeepSeek y
   OpenAI comparten la **misma** implementación porque el protocolo es idéntico;
-  duplicar habría sido over-engineering. `Engine::from_env` elige entre ambos
-  según `DEEPSEEK_API_KEY` (preferido) u `OPENAI_API_KEY`.
+  duplicar habría sido over-engineering. ~~`Engine::from_env` elige entre ambos
+  según `DEEPSEEK_API_KEY` (preferido) u `OPENAI_API_KEY`.~~ **Superado por
+  [ADR-0008]:** ya no hay `from_env`; el motor cachea proveedores perezosamente
+  y los resuelve por modelo en cada turno.
 - La `base_url` y el `model` tienen valores por defecto en cada constructor;
   un selector de modelo en la UI y la configurabilidad desde config de usuario
   entran más adelante en Fase 4.

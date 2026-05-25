@@ -13,8 +13,9 @@
 pub mod snapshot;
 pub mod store;
 
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -23,7 +24,8 @@ use futures::{Stream, StreamExt};
 pub use snapshot::Snapshots;
 pub use store::{SessionMeta, Store};
 pub use zhi_provider::{
-    is_reasoning_model, EventStream, Message, Provider, Role, StreamEvent, ToolCall,
+    default_model, is_reasoning_model, EventStream, Message, Provider, ProviderSpec, Role,
+    StreamEvent, ToolCall, PROVIDERS,
 };
 pub use zhi_tool::{ToolContext, ToolRegistry};
 
@@ -42,8 +44,13 @@ pub enum Error {
     Storage(#[from] sqlx::Error),
     #[error("error de snapshot: {0}")]
     Snapshot(String),
-    #[error("falta una clave de proveedor en el entorno (DEEPSEEK_API_KEY u OPENAI_API_KEY)")]
-    MissingApiKey,
+    #[error("modelo desconocido: {0}")]
+    UnknownModel(String),
+    #[error("falta la variable de entorno {env_var} para usar el modelo «{model}»")]
+    MissingApiKey {
+        env_var: &'static str,
+        model: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -184,43 +191,61 @@ pub type AgentStream = Pin<Box<dyn Stream<Item = Result<AgentEvent>> + Send>>;
 
 // ── Motor ──────────────────────────────────────────────────────────────────────
 
-/// El motor: posee el proveedor LLM y el registro de tools; orquesta los turnos.
+/// El motor: registro de tools y caché perezosa de proveedores LLM por id.
 ///
-/// `provider` es `Arc<dyn Provider>`: el motor no se acopla a un proveedor
-/// concreto. La elección por variable de entorno vive en [`Engine::from_env`].
+/// La elección del proveedor depende del modelo activo en cada turno: el
+/// catálogo estático `zhi_provider::PROVIDERS` asocia cada modelo a su
+/// `ProviderSpec` (URL base + variable de entorno). El cliente se construye la
+/// primera vez que se usa y se cachea hasta que el proceso muera; si falta la
+/// clave correspondiente se devuelve [`Error::MissingApiKey`] **en el turno**,
+/// no en el arranque. Esto desacopla el selector de modelo de la presencia de
+/// credenciales: ver [ADR-0008](../../docs/decisions/0008-multi-proveedor-catalogo-estatico.md).
 #[derive(Clone)]
 pub struct Engine {
-    provider: Arc<dyn Provider>,
+    providers: Arc<Mutex<HashMap<&'static str, Arc<dyn Provider>>>>,
     tools: ToolRegistry,
 }
 
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Engine {
-    /// Construye el motor eligiendo proveedor según las variables de entorno
-    /// disponibles: `DEEPSEEK_API_KEY` (preferido) u `OPENAI_API_KEY`. Registra
-    /// las tools integradas.
-    pub fn from_env() -> Result<Self> {
-        let provider: Arc<dyn Provider> = if let Ok(key) = std::env::var("DEEPSEEK_API_KEY") {
-            Arc::new(zhi_provider::OpenAiCompatible::deepseek(key))
-        } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-            Arc::new(zhi_provider::OpenAiCompatible::openai(key))
-        } else {
-            return Err(Error::MissingApiKey);
-        };
-        Ok(Self {
-            provider,
+    /// Construye el motor con las tools integradas y la caché de proveedores
+    /// vacía. Infalible: no requiere credenciales hasta que se ejecute un turno.
+    pub fn new() -> Self {
+        Self {
+            providers: Arc::new(Mutex::new(HashMap::new())),
             tools: ToolRegistry::with_builtins(),
-        })
+        }
     }
 
-    /// Modelo por defecto del proveedor activo. La UI lo usa como valor inicial
-    /// del selector cuando una sesión no tiene modelo persistido.
-    pub fn default_model(&self) -> String {
-        self.provider.default_model().to_string()
-    }
-
-    /// Catálogo de modelos del proveedor activo para el selector de la UI.
-    pub fn available_models(&self) -> Vec<String> {
-        self.provider.available_models()
+    /// Resuelve el cliente del proveedor asociado al modelo, construyéndolo y
+    /// cacheándolo si es la primera vez. Devuelve [`Error::UnknownModel`] si el
+    /// modelo no está en el catálogo, o [`Error::MissingApiKey`] si su variable
+    /// de entorno no está definida.
+    fn provider_for(&self, model: &str) -> Result<Arc<dyn Provider>> {
+        let spec = zhi_provider::find_provider_for_model(model)
+            .ok_or_else(|| Error::UnknownModel(model.to_string()))?;
+        // El `Mutex` solo cubre la caché en memoria; la creación del cliente
+        // (no async) ocurre con el lock tomado, que es trivial y rápido.
+        let mut providers = self
+            .providers
+            .lock()
+            .expect("mutex de proveedores envenenado");
+        if let Some(p) = providers.get(spec.id) {
+            return Ok(p.clone());
+        }
+        let key = std::env::var(spec.env_var).map_err(|_| Error::MissingApiKey {
+            env_var: spec.env_var,
+            model: model.to_string(),
+        })?;
+        let client: Arc<dyn Provider> =
+            Arc::new(zhi_provider::OpenAiCompatible::from_spec(spec, key));
+        providers.insert(spec.id, client.clone());
+        Ok(client)
     }
 
     /// Ejecuta un turno completo del agente: llama al proveedor, ejecuta las tools
@@ -230,8 +255,9 @@ impl Engine {
     /// `agent` controla el system prompt y el conjunto de tools ofrecidas: en
     /// modo [`AgentKind::Plan`] solo se exponen las de solo lectura, y si el
     /// modelo pide una tool con efectos igualmente, la ejecución se rechaza.
-    /// `model` se pasa al proveedor por turno (mirror del `agent`); persiste por
-    /// sesión en `sessions.model`.
+    /// `model` se pasa al proveedor por turno y selecciona qué cliente usar.
+    /// Si la clave del proveedor del modelo no está en el entorno, el stream
+    /// emite [`Error::MissingApiKey`] y termina.
     ///
     /// Si se provee `snapshots`, antes de ejecutar las tools de un paso que
     /// requiera permiso, se captura el estado del worktree y se emite un
@@ -245,7 +271,7 @@ impl Engine {
         snapshots: Option<Snapshots>,
         resolver: Arc<dyn PermissionResolver>,
     ) -> AgentStream {
-        let provider = self.provider.clone();
+        let engine = self.clone();
         let registry = self.tools.clone();
         let tool_specs: Vec<zhi_provider::ToolSpec> = registry
             .iter()
@@ -256,6 +282,10 @@ impl Engine {
             .collect();
 
         let stream = try_stream! {
+            // Se resuelve aquí (no en `init`) para que la falta de clave salga
+            // como error del stream que la UI ya sabe pintar, en vez de bloquear
+            // el arranque o el botón de modelo.
+            let provider = engine.provider_for(&model)?;
             let mut messages = Vec::with_capacity(history.len() + 1);
             messages.push(Message::system(agent.system_prompt()));
             messages.extend(history);
