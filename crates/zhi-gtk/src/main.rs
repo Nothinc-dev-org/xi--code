@@ -1866,9 +1866,11 @@ fn spawn_catalog_refresh() {
     });
 }
 
-/// Modal de selección de modelo. Lista los modelos del catálogo como un grupo
-/// radio (un único `CheckButton` `set_group`-ado); al confirmar invoca
-/// `on_select(modelID)` con el id puro. Si el usuario cancela, no se invoca nada.
+/// Modal de selección de modelo. Lista los modelos del catálogo (miles)
+/// dentro de un `ScrolledWindow` con altura acotada y un `SearchEntry` para
+/// filtrar por substring (insensible a mayúsculas). Al activar una fila o
+/// pulsar "Aplicar" se invoca `on_select(provider/model)`; cancelar no
+/// invoca nada.
 fn show_model_picker_dialog(
     parent: &adw::ApplicationWindow,
     current: &str,
@@ -1882,42 +1884,116 @@ fn show_model_picker_dialog(
     dialog.set_default_response(Some("apply"));
     dialog.set_close_response("cancel");
 
-    let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    list.set_margin_top(8);
+    let container = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    container.set_margin_top(4);
+    container.set_size_request(420, -1);
 
-    let selected = Rc::new(Cell::new(
-        options.iter().position(|o| o.value == current).unwrap_or(0),
-    ));
-    let mut group: Option<gtk::CheckButton> = None;
+    let search = gtk::SearchEntry::new();
+    search.set_placeholder_text(Some("Buscar modelo o proveedor…"));
+    container.append(&search);
+
+    let scroller = gtk::ScrolledWindow::new();
+    scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
+    scroller.set_propagate_natural_height(true);
+    // Altura acotada: con miles de modelos, sin esto el diálogo se sale de
+    // la pantalla. `max_content_height` requiere `propagate_natural_height`.
+    scroller.set_min_content_height(360);
+    scroller.set_max_content_height(480);
+
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::Single);
+    list.add_css_class("boxed-list");
+    scroller.set_child(Some(&list));
+    container.append(&scroller);
+    dialog.set_extra_child(Some(&container));
+
+    let values: Rc<Vec<String>> = Rc::new(options.iter().map(|o| o.value.clone()).collect());
+    let current_idx = options.iter().position(|o| o.value == current);
+
     for (idx, option) in options.iter().enumerate() {
-        let radio = gtk::CheckButton::with_label(&option.label);
-        if let Some(first) = &group {
-            radio.set_group(Some(first));
-        } else {
-            group = Some(radio.clone());
+        let row = gtk::ListBoxRow::new();
+        // Guardamos el índice en el widget como hijo `Label` invisible; más
+        // simple y robusto que usar GObject data en este punto.
+        let label = gtk::Label::new(Some(&option.label));
+        label.set_xalign(0.0);
+        label.set_margin_top(8);
+        label.set_margin_bottom(8);
+        label.set_margin_start(12);
+        label.set_margin_end(12);
+        row.set_child(Some(&label));
+        // Etiqueta minúscula como búsqueda preprocesada para el filtro.
+        let needle_target: Rc<String> = Rc::new(option.label.to_lowercase());
+        unsafe {
+            row.set_data::<usize>("idx", idx);
+            row.set_data::<Rc<String>>("needle", needle_target);
         }
-        if idx == selected.get() {
-            radio.set_active(true);
-        }
-        let selected = selected.clone();
-        radio.connect_toggled(move |b| {
-            if b.is_active() {
-                selected.set(idx);
-            }
-        });
-        list.append(&radio);
+        list.append(&row);
     }
-    dialog.set_extra_child(Some(&list));
 
-    let values: Vec<String> = options.iter().map(|o| o.value.clone()).collect();
+    // Seleccionar y enfocar el modelo activo al abrir, para que el usuario
+    // vea de inmediato dónde está. El scroll a esa fila se hace tras el
+    // present con `idle_add_local_once`.
+    if let Some(idx) = current_idx {
+        if let Some(row) = list.row_at_index(idx as i32) {
+            list.select_row(Some(&row));
+            let row_clone = row.clone();
+            gtk::glib::idle_add_local_once(move || {
+                row_clone.grab_focus();
+            });
+        }
+    }
+
+    // Filtro por substring sobre la etiqueta preprocesada (minúsculas).
+    {
+        let search_for_filter = search.clone();
+        list.set_filter_func(move |row| {
+            let needle = search_for_filter.text().to_string();
+            if needle.is_empty() {
+                return true;
+            }
+            let needle = needle.to_lowercase();
+            let stored = unsafe { row.data::<Rc<String>>("needle") };
+            stored
+                .map(|ptr| {
+                    let s = unsafe { ptr.as_ref() };
+                    s.contains(&needle)
+                })
+                .unwrap_or(true)
+        });
+        let list_for_search = list.clone();
+        search.connect_search_changed(move |_| {
+            list_for_search.invalidate_filter();
+        });
+    }
+
+    // Activar una fila (Enter o doble clic) selecciona y emite "apply": el
+    // `connect_response` de abajo se encarga del resto.
+    {
+        let dialog_for_activate = dialog.clone();
+        list.connect_row_activated(move |list, row| {
+            list.select_row(Some(row));
+            dialog_for_activate.response("apply");
+        });
+    }
+
+    // Botón "Aplicar": aplica la fila seleccionada actualmente.
+    let list_for_response = list.clone();
     dialog.connect_response(None, move |_, response| {
         if response != "apply" {
             return;
         }
-        if let Some(chosen) = values.get(selected.get()) {
+        let Some(row) = list_for_response.selected_row() else {
+            return;
+        };
+        let Some(ptr) = (unsafe { row.data::<usize>("idx") }) else {
+            return;
+        };
+        let idx = unsafe { *ptr.as_ref() };
+        if let Some(chosen) = values.get(idx) {
             on_select(chosen.clone());
         }
     });
+
     dialog.present();
 }
 
