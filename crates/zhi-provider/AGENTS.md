@@ -1,17 +1,22 @@
 # AGENTS.md — zhi-provider
 
 > Implementado: trait `Provider` (un método `stream_chat`), cliente único
-> `OpenAiCompatible` que cubre cualquier endpoint con API estilo OpenAI
-> (DeepSeek, OpenAI, Groq, vLLM, Ollama, …) — `::new(key, base_url)` para
-> endpoints arbitrarios y `::from_spec(spec, key)` para los del catálogo.
-> Streaming SSE (Fase 1), *function calling* —`tools` en la petición,
-> agregación de `tool_calls` del stream— (Fase 3) y *chain of thought*
-> (`reasoning_content`) en el stream. **Catálogo estático multi-proveedor**
-> (`PROVIDERS: &[ProviderSpec]`, `default_model()`, `find_provider_for_model`)
-> que vive aquí: el catálogo es navegable sin instanciar nada ni leer claves;
-> la selección del modelo no depende de qué proveedor esté instanciado. Ver
-> [ADR-0008](../../docs/decisions/0008-multi-proveedor-catalogo-estatico.md).
-> Pendiente: otros formatos no-OpenAI (Anthropic) si entran.
+> `OpenAiCompatible::new(key, base_url)` que cubre cualquier endpoint con API
+> estilo OpenAI (DeepSeek, OpenAI, Groq, Together, DeepInfra, Cerebras,
+> Mistral, Perplexity, xAI, Vercel, vLLM, Ollama, …). Streaming SSE (Fase 1),
+> *function calling* (Fase 3) y *chain of thought* (`reasoning_content`).
+>
+> **Catálogo dinámico** en el módulo `catalog`: poblado desde `models.dev`
+> (snapshot embebido `assets/models.json` + cache XDG + refresh background).
+> Filtro `Catalog::openai_compatible()` a los SDKs en `OPENAI_COMPATIBLE_NPM`
+> (los que el cliente `OpenAiCompatible` sabe hablar). Identificador
+> `ModelRef { provider_id, model_id }` serializado como `provider/model`.
+> Ver [ADR-0009](../../docs/decisions/0009-catalogo-models-dev.md) (sustituye
+> a [ADR-0008](../../docs/decisions/0008-multi-proveedor-catalogo-estatico.md)
+> en lo relativo al catálogo).
+>
+> Pendiente: otros formatos no-OpenAI (Anthropic) si entran — habría que
+> ampliar `OPENAI_COMPATIBLE_NPM` y añadir el `Provider` correspondiente.
 > Lee `/AGENTS.md` y `docs/architecture.md` antes de tocarlo.
 
 ## Responsabilidad

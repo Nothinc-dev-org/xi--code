@@ -24,8 +24,8 @@ use futures::{Stream, StreamExt};
 pub use snapshot::Snapshots;
 pub use store::{SessionMeta, Store};
 pub use zhi_provider::{
-    default_model, is_reasoning_model, EventStream, Message, Provider, ProviderSpec, Role,
-    StreamEvent, ToolCall, PROVIDERS,
+    catalog as catalog_internals, Catalog, EventStream, Message, ModelInfo, ModelRef, ModelStatus,
+    Provider, ProviderInfo, Role, StreamEvent, ToolCall,
 };
 pub use zhi_tool::{ToolContext, ToolRegistry};
 
@@ -44,13 +44,10 @@ pub enum Error {
     Storage(#[from] sqlx::Error),
     #[error("error de snapshot: {0}")]
     Snapshot(String),
-    #[error("modelo desconocido: {0}")]
+    #[error("modelo desconocido en el catálogo: {0}")]
     UnknownModel(String),
     #[error("falta la variable de entorno {env_var} para usar el modelo «{model}»")]
-    MissingApiKey {
-        env_var: &'static str,
-        model: String,
-    },
+    MissingApiKey { env_var: String, model: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -191,60 +188,68 @@ pub type AgentStream = Pin<Box<dyn Stream<Item = Result<AgentEvent>> + Send>>;
 
 // ── Motor ──────────────────────────────────────────────────────────────────────
 
-/// El motor: registro de tools y caché perezosa de proveedores LLM por id.
+/// El motor: catálogo de modelos, registro de tools y caché perezosa de
+/// clientes LLM por proveedor.
 ///
-/// La elección del proveedor depende del modelo activo en cada turno: el
-/// catálogo estático `zhi_provider::PROVIDERS` asocia cada modelo a su
-/// `ProviderSpec` (URL base + variable de entorno). El cliente se construye la
-/// primera vez que se usa y se cachea hasta que el proceso muera; si falta la
-/// clave correspondiente se devuelve [`Error::MissingApiKey`] **en el turno**,
-/// no en el arranque. Esto desacopla el selector de modelo de la presencia de
-/// credenciales: ver [ADR-0008](../../docs/decisions/0008-multi-proveedor-catalogo-estatico.md).
+/// El catálogo (filtrado a proveedores OpenAI-compatible) se inyecta al
+/// construir el motor. Cada turno trae un [`ModelRef`] (`provider/model`); el
+/// motor busca el `ProviderInfo` en el catálogo, instancia
+/// `OpenAiCompatible` con su `base_url` y la clave de su `env`, y cachea el
+/// cliente para no reconstruirlo. La falta de clave es un error del turno, no
+/// del arranque (ver [ADR-0008] y [ADR-0009]).
 #[derive(Clone)]
 pub struct Engine {
-    providers: Arc<Mutex<HashMap<&'static str, Arc<dyn Provider>>>>,
+    catalog: Arc<Catalog>,
+    providers: Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>,
     tools: ToolRegistry,
 }
 
-impl Default for Engine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Engine {
-    /// Construye el motor con las tools integradas y la caché de proveedores
-    /// vacía. Infalible: no requiere credenciales hasta que se ejecute un turno.
-    pub fn new() -> Self {
+    /// Construye el motor sobre el catálogo dado. El catálogo se asume ya
+    /// filtrado a proveedores compatibles (`Catalog::openai_compatible`).
+    pub fn new(catalog: Arc<Catalog>) -> Self {
         Self {
+            catalog,
             providers: Arc::new(Mutex::new(HashMap::new())),
             tools: ToolRegistry::with_builtins(),
         }
     }
 
+    /// Catálogo activo (compartido con la UI para presentar el picker).
+    pub fn catalog(&self) -> &Arc<Catalog> {
+        &self.catalog
+    }
+
     /// Resuelve el cliente del proveedor asociado al modelo, construyéndolo y
     /// cacheándolo si es la primera vez. Devuelve [`Error::UnknownModel`] si el
-    /// modelo no está en el catálogo, o [`Error::MissingApiKey`] si su variable
-    /// de entorno no está definida.
-    fn provider_for(&self, model: &str) -> Result<Arc<dyn Provider>> {
-        let spec = zhi_provider::find_provider_for_model(model)
-            .ok_or_else(|| Error::UnknownModel(model.to_string()))?;
-        // El `Mutex` solo cubre la caché en memoria; la creación del cliente
-        // (no async) ocurre con el lock tomado, que es trivial y rápido.
+    /// modelo no está en el catálogo, o [`Error::MissingApiKey`] si la variable
+    /// de entorno del proveedor no está definida.
+    fn provider_for(&self, model_ref: &ModelRef) -> Result<Arc<dyn Provider>> {
+        let (provider, _) = self
+            .catalog
+            .resolve(model_ref)
+            .ok_or_else(|| Error::UnknownModel(model_ref.to_string()))?;
+        let base_url = provider.base_url.clone().ok_or_else(|| {
+            Error::UnknownModel(format!("el proveedor «{}» no expone base_url", provider.id))
+        })?;
         let mut providers = self
             .providers
             .lock()
             .expect("mutex de proveedores envenenado");
-        if let Some(p) = providers.get(spec.id) {
+        if let Some(p) = providers.get(&provider.id) {
             return Ok(p.clone());
         }
-        let key = std::env::var(spec.env_var).map_err(|_| Error::MissingApiKey {
-            env_var: spec.env_var,
-            model: model.to_string(),
+        let env_var = provider.env_var().ok_or_else(|| Error::MissingApiKey {
+            env_var: String::new(),
+            model: model_ref.to_string(),
+        })?;
+        let key = std::env::var(env_var).map_err(|_| Error::MissingApiKey {
+            env_var: env_var.to_string(),
+            model: model_ref.to_string(),
         })?;
         let client: Arc<dyn Provider> =
-            Arc::new(zhi_provider::OpenAiCompatible::from_spec(spec, key));
-        providers.insert(spec.id, client.clone());
+            Arc::new(zhi_provider::OpenAiCompatible::new(key, base_url));
+        providers.insert(provider.id.clone(), client.clone());
         Ok(client)
     }
 
@@ -282,10 +287,16 @@ impl Engine {
             .collect();
 
         let stream = try_stream! {
+            // El identificador puede llegar como `provider/model` o, por
+            // compatibilidad con sesiones legacy, como `model` suelto que se
+            // resuelve contra el catálogo.
+            let model_ref = ModelRef::parse(&model)
+                .or_else(|| engine.catalog.resolve_legacy(&model))
+                .ok_or_else(|| Error::UnknownModel(model.clone()))?;
             // Se resuelve aquí (no en `init`) para que la falta de clave salga
             // como error del stream que la UI ya sabe pintar, en vez de bloquear
             // el arranque o el botón de modelo.
-            let provider = engine.provider_for(&model)?;
+            let provider = engine.provider_for(&model_ref)?;
             let mut messages = Vec::with_capacity(history.len() + 1);
             messages.push(Message::system(agent.system_prompt()));
             messages.extend(history);
@@ -298,7 +309,7 @@ impl Engine {
 
             for _ in 0..MAX_STEPS {
                 let mut inner = provider
-                    .stream_chat(&model, messages.clone(), tool_specs.clone())
+                    .stream_chat(&model_ref.model_id, messages.clone(), tool_specs.clone())
                     .await?;
                 let mut text = String::new();
                 let mut reasoning = String::new();

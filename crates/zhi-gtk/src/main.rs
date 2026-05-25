@@ -19,9 +19,9 @@ use futures::StreamExt;
 use relm4::adw::prelude::*;
 use relm4::{adw, gtk, Component, ComponentParts, ComponentSender, RelmApp, RelmWidgetExt};
 use zhi_core::{
-    is_reasoning_model, AgentEvent, AgentKind, Engine, Message, PermissionDecision,
+    AgentEvent, AgentKind, Catalog, Engine, Message, ModelRef, PermissionDecision,
     PermissionRequest, PermissionResolver, Role, Session, SessionMeta, Snapshots, Store,
-    ToolContext, PROVIDERS,
+    ToolContext,
 };
 
 const APP_ID: &str = "ai.xiecode.App";
@@ -467,8 +467,14 @@ impl Component for App {
 
         let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        let engine = Engine::new();
-        let current_model = zhi_core::default_model().to_string();
+        // Catálogo: snapshot embebido al instante (la app nunca arranca sin
+        // catálogo). El refresco contra models.dev corre en background.
+        let catalog = Arc::new(Catalog::load().openai_compatible());
+        let engine = Engine::new(catalog.clone());
+        let current_model = catalog
+            .default_model()
+            .map(|r| r.to_string())
+            .unwrap_or_default();
         let model = App {
             engine,
             store: store.clone(),
@@ -518,19 +524,20 @@ impl Component for App {
             widgets.entry.add_controller(controller);
         }
 
-        if !any_provider_key_present() {
-            let vars: Vec<&'static str> = PROVIDERS.iter().map(|p| p.env_var).collect();
+        if !any_provider_key_present(&catalog) {
             append_bubble(
                 &widgets.chat_list,
                 Role::System,
-                &format!(
-                    "No hay ninguna clave de proveedor en el entorno ({}). Puedes elegir \
-                     modelo de todos modos; al enviar un mensaje, la app te dirá qué \
-                     variable falta.",
-                    vars.join(", ")
-                ),
+                "No hay ninguna clave de proveedor en el entorno. Puedes navegar \
+                 el catálogo y elegir modelo; al enviar un mensaje, la app te \
+                 indicará la variable que falta exportar.",
             );
         }
+
+        // Refresco del catálogo en background: descarga models.dev a la cache
+        // si está stale. La app sigue usando el catálogo ya cargado; el JSON
+        // fresco se aplica en el próximo arranque (igual que OpenCode).
+        spawn_catalog_refresh();
 
         // Arranque asíncrono: migrar el esquema, resolver el proyecto (directorio
         // de trabajo) y listar sus sesiones. El resultado vuelve por `sender`.
@@ -614,10 +621,13 @@ impl Component for App {
                 }
                 self.current_session = Some(id);
                 self.current_agent = meta.agent;
-                self.current_model = meta
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| zhi_core::default_model().to_string());
+                self.current_model = meta.model.clone().unwrap_or_else(|| {
+                    self.engine
+                        .catalog()
+                        .default_model()
+                        .map(|r| r.to_string())
+                        .unwrap_or_default()
+                });
                 self.streaming_bubble = None;
                 self.tool_output = None;
                 self.tool_card = None;
@@ -795,7 +805,7 @@ impl Component for App {
             }
 
             Msg::OpenModelPicker => {
-                let options = catalog_model_options();
+                let options = catalog_model_options(self.engine.catalog());
                 tracing::debug!(current = %self.current_model, count = options.len(), "modelo: abriendo selector");
                 let current = self.current_model.clone();
                 let sender_dialog = sender.clone();
@@ -1218,12 +1228,15 @@ fn update_controls(model: &App, widgets: &AppWidgets) {
         AgentKind::Plan => widgets.agent_plan.set_active(true),
     }
 
-    let model_label = if model.current_model.is_empty() {
-        "Modelo"
+    let model_label: String = if model.current_model.is_empty() {
+        "Modelo".to_string()
     } else {
-        model.current_model.as_str()
+        // Mostrar solo `model_id` (parte tras el slash) si viene como par.
+        ModelRef::parse(&model.current_model)
+            .map(|r| r.model_id)
+            .unwrap_or_else(|| model.current_model.clone())
     };
-    widgets.model_button.set_label(model_label);
+    widgets.model_button.set_label(&model_label);
     widgets.model_button.set_sensitive(!model.busy);
 
     // Botón ojo: solo visible si el modelo activo es razonador. El estado e
@@ -1231,7 +1244,10 @@ fn update_controls(model: &App, widgets: &AppWidgets) {
     // necesario porque el `set_active` con el valor que ya tiene es no-op y
     // si difiere, el handler emite `ToggleReasoning(b.is_active())` con el
     // mismo valor que ya hay en el estado: el update se vuelve idempotente.
-    let reasoning_visible = is_reasoning_model(&model.current_model);
+    let reasoning_visible = ModelRef::parse(&model.current_model)
+        .or_else(|| model.engine.catalog().resolve_legacy(&model.current_model))
+        .map(|r| model.engine.catalog().is_reasoning_model(&r))
+        .unwrap_or(false);
     widgets.reasoning_button.set_visible(reasoning_visible);
     if reasoning_visible {
         widgets.reasoning_button.set_active(model.show_reasoning);
@@ -1794,38 +1810,60 @@ fn show_revert_dialog(
     dialog.present();
 }
 
-/// Una opción del picker de modelos: `value` es el id que persistimos y se
-/// envía al motor; `label` es la cadena visible (incluye el proveedor y, si
-/// procede, un aviso de clave faltante).
+/// Una opción del picker de modelos: `value` es el `provider/model` que se
+/// persiste y se envía al motor; `label` es la cadena visible.
 struct ModelOption {
     value: String,
     label: String,
 }
 
-/// Construye la lista plana de modelos del catálogo agrupados por proveedor,
-/// anotando los que carecen de su variable de entorno.
-fn catalog_model_options() -> Vec<ModelOption> {
-    PROVIDERS
-        .iter()
+/// Construye la lista de modelos del catálogo agrupados por proveedor,
+/// filtrando los marcados como `deprecated`. No distingue por presencia de
+/// API key: el patrón de OpenCode muestra el universo entero; la falta de
+/// clave se reporta solo si el usuario intenta enviar con ese modelo.
+fn catalog_model_options(catalog: &Catalog) -> Vec<ModelOption> {
+    catalog
+        .providers()
         .flat_map(|p| {
-            let has_key = std::env::var_os(p.env_var).is_some();
-            p.models.iter().map(move |&m| ModelOption {
-                value: m.to_string(),
-                label: if has_key {
-                    format!("{m}  ·  {}", p.name)
-                } else {
-                    format!("{m}  ·  {} (falta {})", p.name, p.env_var)
-                },
-            })
+            p.models
+                .values()
+                .filter(|m| m.status != Some(zhi_core::ModelStatus::Deprecated))
+                .map(move |m| {
+                    let label_model = m.name.as_deref().unwrap_or(&m.id);
+                    ModelOption {
+                        value: ModelRef::new(&p.id, &m.id).to_string(),
+                        label: format!("{label_model}  ·  {}", p.name),
+                    }
+                })
         })
         .collect()
 }
 
-/// `true` si al menos una de las variables de entorno del catálogo está puesta.
-fn any_provider_key_present() -> bool {
-    PROVIDERS
-        .iter()
-        .any(|p| std::env::var_os(p.env_var).is_some())
+/// `true` si al menos uno de los proveedores del catálogo filtrado tiene su
+/// API key en el entorno.
+fn any_provider_key_present(catalog: &Catalog) -> bool {
+    catalog.providers().any(|p| p.has_api_key())
+}
+
+/// Lanza una tarea Tokio que refresca la cache de `models.dev` cuando está
+/// stale, y la repite cada `REFRESH_INTERVAL`. La sesión actual seguirá con
+/// el catálogo ya cargado en memoria; el JSON fresco se usará al próximo
+/// arranque (mismo patrón que OpenCode). Respeta `XIE_DISABLE_MODELS_FETCH`.
+fn spawn_catalog_refresh() {
+    if std::env::var_os("XIE_DISABLE_MODELS_FETCH").is_some() {
+        return;
+    }
+    relm4::spawn(async move {
+        loop {
+            if !Catalog::cache_is_fresh() {
+                match Catalog::fetch_and_cache().await {
+                    Ok(_) => tracing::debug!("models.dev: cache refrescada"),
+                    Err(e) => tracing::warn!(error = %e, "no se pudo refrescar models.dev"),
+                }
+            }
+            tokio::time::sleep(zhi_core::catalog_internals::REFRESH_INTERVAL).await;
+        }
+    });
 }
 
 /// Modal de selección de modelo. Lista los modelos del catálogo como un grupo

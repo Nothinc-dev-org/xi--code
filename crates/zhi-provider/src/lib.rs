@@ -1,16 +1,20 @@
-//! Abstracción de proveedores de LLM y la implementación de DeepSeek.
+//! Abstracción de proveedores de LLM y cliente compatible con OpenAI.
 //!
-//! El trait [`Provider`] es la abstracción común; [`DeepSeek`] es la primera
-//! implementación. DeepSeek expone una API compatible con OpenAI
-//! (`POST /chat/completions` con `stream: true`, eventos SSE). Soporta
-//! *function calling*: la petición lleva un array `tools` y el stream devuelve
-//! `tool_calls` troceados que aquí se agregan. Ver `crates/zhi-provider/AGENTS.md`.
+//! El trait [`Provider`] es la abstracción común; [`OpenAiCompatible`] es el
+//! cliente concreto que habla `POST /chat/completions` con SSE y *function
+//! calling* sobre cualquier endpoint estilo OpenAI. El catálogo de
+//! proveedores/modelos que la app conoce vive en [`catalog`], poblado desde
+//! `models.dev` (snapshot embebido + cache + refresh; ver `ADR-0009`).
+
+pub mod catalog;
 
 use std::pin::Pin;
 
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
+
+pub use catalog::{Catalog, ModelInfo, ModelRef, ModelStatus, ProviderInfo, OPENAI_COMPATIBLE_NPM};
 
 /// Error del crate. Cada proveedor mapea sus fallos a estas variantes.
 #[derive(Debug, thiserror::Error)]
@@ -174,9 +178,8 @@ pub enum StreamEvent {
 /// Stream de eventos de una respuesta del modelo.
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 
-/// Abstracción común de un proveedor de LLM. Los proveedores concretos
-/// (DeepSeek, OpenAI, …) implementan este trait; `zhi-core::Engine` resuelve la
-/// instancia adecuada por modelo a partir del catálogo estático [`PROVIDERS`].
+/// Abstracción común de un proveedor de LLM. La instancia concreta se elige
+/// según el modelo del turno usando el catálogo en [`Catalog`].
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Envía la conversación con `model` (con las `tools` disponibles) y devuelve
@@ -191,73 +194,12 @@ pub trait Provider: Send + Sync {
     ) -> Result<EventStream>;
 }
 
-/// Descripción estática de un proveedor LLM conocido por la app: su id estable,
-/// el nombre visible, la URL base de su API estilo OpenAI, la variable de
-/// entorno donde se busca la clave y el catálogo de modelos.
-///
-/// El catálogo de modelos se expone a la UI sin instanciar ningún cliente y sin
-/// requerir credenciales: el botón de modelo siempre es navegable.
-#[derive(Debug, Clone, Copy)]
-pub struct ProviderSpec {
-    pub id: &'static str,
-    pub name: &'static str,
-    pub base_url: &'static str,
-    pub env_var: &'static str,
-    pub models: &'static [&'static str],
-}
-
-/// Modelos conocidos de DeepSeek expuestos en el selector.
-pub const DEEPSEEK_MODELS: &[&str] = &["deepseek-chat", "deepseek-reasoner"];
-
-/// Modelos conocidos de OpenAI expuestos en el selector.
-pub const OPENAI_MODELS: &[&str] = &["gpt-4o-mini", "gpt-4o"];
-
-/// Catálogo de proveedores conocidos. El orden define la prioridad para
-/// resolver el modelo por defecto y para presentarlos en la UI.
-pub const PROVIDERS: &[ProviderSpec] = &[
-    ProviderSpec {
-        id: "deepseek",
-        name: "DeepSeek",
-        base_url: "https://api.deepseek.com",
-        env_var: "DEEPSEEK_API_KEY",
-        models: DEEPSEEK_MODELS,
-    },
-    ProviderSpec {
-        id: "openai",
-        name: "OpenAI",
-        base_url: "https://api.openai.com/v1",
-        env_var: "OPENAI_API_KEY",
-        models: OPENAI_MODELS,
-    },
-];
-
-/// Modelo por defecto del catálogo (primer modelo del primer proveedor).
-pub fn default_model() -> &'static str {
-    PROVIDERS[0].models[0]
-}
-
-/// Busca el proveedor cuyo catálogo contiene `model_id`. Devuelve el primero
-/// que coincida; el catálogo está cerrado y no hay solapamientos.
-pub fn find_provider_for_model(model_id: &str) -> Option<&'static ProviderSpec> {
-    PROVIDERS.iter().find(|p| p.models.contains(&model_id))
-}
-
-/// Modelos que exponen *chain of thought* vía `reasoning_content` en el SSE.
-/// La UI consulta este catálogo para mostrar/ocultar el botón de visibilidad
-/// de pensamientos: si el modelo activo no está aquí, el control no aparece.
-pub const REASONING_MODELS: &[&str] = &["deepseek-reasoner"];
-
-/// `true` si `model` emite *chain of thought* (`reasoning_content`).
-pub fn is_reasoning_model(model: &str) -> bool {
-    REASONING_MODELS.contains(&model)
-}
-
 /// Cliente para cualquier endpoint con API **compatible con OpenAI** (DeepSeek,
 /// OpenAI, Groq, vLLM, Ollama…). El protocolo (`POST /chat/completions`, SSE,
 /// `tool_calls` troceados) es idéntico; lo que cambia es la `base_url`.
 ///
-/// El modelo no se fija aquí: viaja por turno en [`Provider::stream_chat`]
-/// (el catálogo vive en [`PROVIDERS`]).
+/// El modelo no se fija aquí: viaja por turno en [`Provider::stream_chat`].
+/// El catálogo de proveedores y modelos vive en [`Catalog`].
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatible {
     client: reqwest::Client,
@@ -273,11 +215,6 @@ impl OpenAiCompatible {
             api_key: api_key.into(),
             base_url: base_url.into(),
         }
-    }
-
-    /// Construye el cliente a partir de una entrada del catálogo y su clave.
-    pub fn from_spec(spec: &ProviderSpec, api_key: impl Into<String>) -> Self {
-        Self::new(api_key, spec.base_url)
     }
 }
 
@@ -452,28 +389,4 @@ struct DeltaFunction {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn catalog_is_coherent() {
-        // El default debe pertenecer a algún proveedor del catálogo.
-        assert!(find_provider_for_model(default_model()).is_some());
-        // Cada modelo del catálogo debe ser resoluble a su `ProviderSpec`.
-        for spec in PROVIDERS {
-            assert!(!spec.models.is_empty(), "{} sin modelos", spec.id);
-            for model in spec.models {
-                let resolved = find_provider_for_model(model).expect("modelo del catálogo");
-                assert_eq!(resolved.id, spec.id);
-            }
-        }
-    }
-
-    #[test]
-    fn unknown_model_is_not_resolvable() {
-        assert!(find_provider_for_model("modelo-inexistente").is_none());
-    }
 }

@@ -80,16 +80,22 @@ Ver [ADR-0007](decisions/0007-tools-permisos-bucle-agente.md).
 - [ ] Subagentes para tareas multi-paso.
 - [x] Trait `Provider` (solo `stream_chat`) y cliente único `OpenAiCompatible`
       cubriendo DeepSeek, OpenAI y cualquier endpoint compatible.
-- [x] **Catálogo estático multi-proveedor** (`PROVIDERS` + `ProviderSpec`) en
-      `zhi-provider`. `Engine::new` es infalible: construye una caché perezosa
-      de clientes y los instancia al resolver el modelo del turno; si falta la
-      clave del proveedor del modelo, emite `Error::MissingApiKey { env_var,
-      model }`. Ver [ADR-0008](decisions/0008-multi-proveedor-catalogo-estatico.md).
+- [x] **Catálogo dinámico desde `models.dev`** en `zhi-provider`
+      (`Catalog::load` con XIE_MODELS_PATH → cache XDG → snapshot embebido;
+      refresh background cada 60 min con TTL de 5 min). Identificador
+      compuesto `provider/model` (`ModelRef`). Filtrado a proveedores
+      OpenAI-compatible (whitelist de `npm`). `Engine` posee `Arc<Catalog>` y
+      resuelve el cliente del proveedor en el turno; `Error::MissingApiKey`
+      indica la `env_var` exacta que falta.
+      Ver [ADR-0009](decisions/0009-catalogo-models-dev.md) (sustituye a
+      [ADR-0008](decisions/0008-multi-proveedor-catalogo-estatico.md) en lo
+      relativo al catálogo).
 - [x] Selector de modelo en la UI (`OpenModelPicker`/`ModelChanged`), modelo
       por turno en `Engine::run_turn` y `Provider::stream_chat`, persistido por
-      sesión. El picker se alimenta del catálogo completo (todos los
-      proveedores conocidos) y marca los modelos cuya clave no está exportada;
-      el botón solo se inhabilita durante un turno.
+      sesión como `provider/model`. El picker muestra todos los modelos del
+      catálogo filtrado, sin distinguir por API key (patrón OpenCode); filtra
+      `status: "deprecated"`. `is_reasoning_model` se lee del catálogo
+      (campo `reasoning` por modelo), no de una whitelist en código.
 - [x] Razonamiento (chain of thought) en streaming: `ReasoningDelta` /
       `ReasoningFinished` en `AgentEvent`, tarjetas colapsables con spinner y
       duración, toggle global. Columnas `reasoning` / `reasoning_ms` en

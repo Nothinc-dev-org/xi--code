@@ -29,10 +29,13 @@ lo que ya está en `docs/`; esto son punteros y estado.
   function calling en `zhi-provider`, `Engine::run_turn`, permisos vía
   `PermissionResolver` + `oneshot`, parts en `messages` con columnas idempotentes.
   → [ADR-0007](../docs/decisions/0007-tools-permisos-bucle-agente.md)
-- Catálogo estático de proveedores en `zhi-provider` (`PROVIDERS` /
-  `ProviderSpec`); `Engine` infalible con caché perezosa de clientes y
-  resolución modelo→proveedor por turno. La falta de clave es un error del
-  turno, no del arranque. → [ADR-0008](../docs/decisions/0008-multi-proveedor-catalogo-estatico.md)
+- Catálogo dinámico desde `models.dev` con snapshot embebido + cache XDG +
+  refresh background; filtrado a proveedores OpenAI-compatible; identificador
+  compuesto `provider/model` (`ModelRef`). `Engine` posee `Arc<Catalog>` y
+  resuelve el cliente del proveedor en el turno; la falta de clave es un
+  error del turno con la `env_var` exacta. → [ADR-0009](../docs/decisions/0009-catalogo-models-dev.md)
+  (sustituye a [ADR-0008](../docs/decisions/0008-multi-proveedor-catalogo-estatico.md)
+  en lo relativo al catálogo; mantiene la decisión de Engine infalible).
 
 ## Estado actual
 
@@ -72,13 +75,15 @@ lo que ya está en `docs/`; esto son punteros y estado.
   terminar el turno se convierte a marcado Pango (`markdown::to_pango` con
   `pulldown-cmark`) y se aplica con `set_markup`, para evitar markup a medias.
 - **Proveedor LLM**: trait `Provider` en `zhi-provider` (un método:
-  `stream_chat`). Catálogo `PROVIDERS` con un `ProviderSpec` por endpoint
-  conocido (DeepSeek, OpenAI) — id, nombre, base_url, env_var y modelos.
-  `find_provider_for_model(id)` resuelve el `ProviderSpec`. El cliente
-  `OpenAiCompatible::from_spec(spec, key)` cubre cualquier endpoint estilo
-  OpenAI. `Engine::new` es infalible y cachea perezosamente los clientes por
-  proveedor; `Error::MissingApiKey { env_var, model }` se emite **en el turno**
-  si la variable del proveedor del modelo no está definida.
+  `stream_chat`). Catálogo en `zhi_provider::catalog::Catalog` poblado de
+  `models.dev` (snapshot embebido `assets/models.json` + cache
+  `$XDG_CACHE_HOME/xiě-code/models.json` con TTL 5 min + refresh cada 60 min).
+  Filtro `Catalog::openai_compatible()` a los proveedores que `OpenAiCompatible`
+  sabe hablar. Identificador `ModelRef { provider_id, model_id }`
+  serializado como `provider/model`. `Engine::new(Arc<Catalog>)` cachea
+  clientes por proveedor; `Error::MissingApiKey { env_var, model }` se emite
+  **en el turno** si la `env_var` del proveedor no está definida. Envs:
+  `XIE_MODELS_URL`, `XIE_MODELS_PATH`, `XIE_DISABLE_MODELS_FETCH`.
 - **Agentes**: `AgentKind` (`Build`/`Plan`) en `zhi-core` determina el system
   prompt y filtra las tools que se exponen al modelo (`Plan` solo lectura).
   `Engine::run_turn(agent, ...)`. Persistido en `sessions.agent`. Selector
