@@ -96,6 +96,16 @@ Ver [ADR-0007](decisions/0007-tools-permisos-bucle-agente.md).
       catálogo filtrado, sin distinguir por API key (patrón OpenCode); filtra
       `status: "deprecated"`. `is_reasoning_model` se lee del catálogo
       (campo `reasoning` por modelo), no de una whitelist en código.
+- [x] **Settings + Connect (auth de proveedores)** estilo OpenCode. Botón
+      Settings junto al de Modelo, modal Configuración con sección Cuentas y
+      botón "Conectar proveedor", modal de selección, y flujo OAuth 2.0+PKCE
+      contra `auth.openai.com` para OpenAI (servidor local en `127.0.0.1:1455`,
+      tokens persistidos en `$XDG_DATA_HOME/xiě-code/auth.json` con permisos
+      0600). Para el resto de proveedores: entrada manual de API key.
+      Ver [ADR-0010](decisions/0010-auth-oauth-openai.md). **Follow-up
+      explícito:** el cliente Codex Responses API (consumo del `access_token`
+      en inferencia) queda pendiente; los tokens se guardan, pero usar la
+      cuenta ChatGPT para chat requiere ese cliente.
 - [x] Razonamiento (chain of thought) en streaming: `ReasoningDelta` /
       `ReasoningFinished` en `AgentEvent`, tarjetas colapsables con spinner y
       duración, toggle global. Columnas `reasoning` / `reasoning_ms` en

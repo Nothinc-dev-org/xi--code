@@ -15,8 +15,17 @@
 > a [ADR-0008](../../docs/decisions/0008-multi-proveedor-catalogo-estatico.md)
 > en lo relativo al catálogo).
 >
-> Pendiente: otros formatos no-OpenAI (Anthropic) si entran — habría que
-> ampliar `OPENAI_COMPATIBLE_NPM` y añadir el `Provider` correspondiente.
+> **Auth y OAuth**: módulo `auth` (persistencia en `auth.json` con permisos
+> 0600, enum `AuthInfo` = `Api | Oauth`) y módulo `oauth` (PKCE S256,
+> servidor HTTP local con `tokio::net::TcpListener`, flujo browser para
+> OpenAI calcado del plugin `codex` de OpenCode). El formato de `auth.json`
+> es compatible con OpenCode. Ver
+> [ADR-0010](../../docs/decisions/0010-auth-oauth-openai.md).
+>
+> Pendiente: cliente Codex Responses API (consumir el `access_token` de
+> OAuth para inferencia); método headless / device flow; otros formatos
+> no-OpenAI (Anthropic) si entran — habría que ampliar
+> `OPENAI_COMPATIBLE_NPM` y añadir el `Provider` correspondiente.
 > Lee `/AGENTS.md` y `docs/architecture.md` antes de tocarlo.
 
 ## Responsabilidad

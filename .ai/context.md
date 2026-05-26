@@ -36,6 +36,12 @@ lo que ya está en `docs/`; esto son punteros y estado.
   error del turno con la `env_var` exacta. → [ADR-0009](../docs/decisions/0009-catalogo-models-dev.md)
   (sustituye a [ADR-0008](../docs/decisions/0008-multi-proveedor-catalogo-estatico.md)
   en lo relativo al catálogo; mantiene la decisión de Engine infalible).
+- Persistencia de credenciales por proveedor (`auth.json` en XDG,
+  permisos 0600) y flujo OAuth 2.0+PKCE para OpenAI (cuenta ChatGPT)
+  calcado del plugin `codex` de OpenCode; `Engine::provider_for` prioriza
+  `AuthInfo::Api` sobre el env var; `AuthInfo::Oauth` queda guardada pero
+  el cliente Codex Responses API es follow-up. →
+  [ADR-0010](../docs/decisions/0010-auth-oauth-openai.md)
 
 ## Estado actual
 

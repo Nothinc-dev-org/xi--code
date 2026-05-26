@@ -19,9 +19,9 @@ use futures::StreamExt;
 use relm4::adw::prelude::*;
 use relm4::{adw, gtk, Component, ComponentParts, ComponentSender, RelmApp, RelmWidgetExt};
 use zhi_core::{
-    AgentEvent, AgentKind, Catalog, Engine, Message, ModelRef, PermissionDecision,
-    PermissionRequest, PermissionResolver, Role, Session, SessionMeta, Snapshots, Store,
-    ToolContext,
+    oauth, AgentEvent, AgentKind, AuthInfo, AuthStore, Catalog, Engine, Message, ModelRef,
+    PermissionDecision, PermissionRequest, PermissionResolver, Role, Session, SessionMeta,
+    Snapshots, Store, ToolContext,
 };
 
 const APP_ID: &str = "ai.xiecode.App";
@@ -164,6 +164,18 @@ enum Msg {
     OpenModelPicker,
     /// El usuario seleccionó un modelo en el modal.
     ModelChanged(String),
+    /// El usuario pulsó el botón de configuración (icono).
+    OpenSettings,
+    /// El usuario pulsó "Connect" en el modal de configuración.
+    OpenConnectProvider,
+    /// El usuario eligió un proveedor para conectar.
+    ConnectProvider(String),
+    /// El flujo OAuth de OpenAI ya tiene `AuthInfo`; persistir y notificar.
+    OauthOpenAiCompleted(AuthInfo),
+    /// El flujo OAuth de OpenAI falló (timeout, CSRF, denegación, etc.).
+    OauthOpenAiFailed(String),
+    /// El usuario desconectó un proveedor desde Configuración.
+    DisconnectProvider(String),
     /// El usuario alternó la visibilidad global del *chain of thought* con el
     /// botón ojo (solo presente si el modelo activo es razonador).
     ToggleReasoning(bool),
@@ -361,6 +373,16 @@ impl Component for App {
                                 sender.input(Msg::ToggleReasoning(b.is_active()));
                             },
                         },
+
+                        #[name = "settings_button"]
+                        gtk::Button {
+                            set_icon_name: "preferences-system-symbolic",
+                            add_css_class: "flat",
+                            set_tooltip_text: Some("Configuración"),
+                            connect_clicked[sender] => move |_| {
+                                sender.input(Msg::OpenSettings);
+                            },
+                        },
                     },
 
                     gtk::Separator {
@@ -470,7 +492,8 @@ impl Component for App {
         // Catálogo: snapshot embebido al instante (la app nunca arranca sin
         // catálogo). El refresco contra models.dev corre en background.
         let catalog = Arc::new(Catalog::load().openai_compatible());
-        let engine = Engine::new(catalog.clone());
+        let auth = AuthStore::load_default();
+        let engine = Engine::new(catalog.clone(), auth);
         let current_model = catalog
             .default_model()
             .map(|r| r.to_string())
@@ -834,6 +857,129 @@ impl Component for App {
                 {
                     meta.model = Some(model);
                 }
+            }
+
+            Msg::OpenSettings => {
+                let sender_dialog = sender.clone();
+                let connected: Vec<(String, String)> = self
+                    .engine
+                    .auth()
+                    .all()
+                    .into_iter()
+                    .map(|(id, info)| {
+                        let kind = match info {
+                            AuthInfo::Oauth { .. } => "OAuth (ChatGPT)",
+                            AuthInfo::Api { .. } => "API key",
+                        };
+                        (id, kind.to_string())
+                    })
+                    .collect();
+                show_settings_dialog(root, &connected, move |action| match action {
+                    SettingsAction::Connect => sender_dialog.input(Msg::OpenConnectProvider),
+                    SettingsAction::Disconnect(id) => {
+                        sender_dialog.input(Msg::DisconnectProvider(id))
+                    }
+                });
+            }
+
+            Msg::OpenConnectProvider => {
+                let sender_dialog = sender.clone();
+                let providers: Vec<(String, String)> = self
+                    .engine
+                    .catalog()
+                    .providers()
+                    .map(|p| (p.id.clone(), p.name.clone()))
+                    .collect();
+                show_connect_provider_dialog(root, &providers, move |provider_id| {
+                    sender_dialog.input(Msg::ConnectProvider(provider_id));
+                });
+            }
+
+            Msg::ConnectProvider(provider_id) => match provider_id.as_str() {
+                "openai" => {
+                    let sender = sender.clone();
+                    show_oauth_waiting_dialog(root);
+                    relm4::spawn(async move {
+                        match oauth::OpenAiOauth::start_browser_flow().await {
+                            Ok(flow) => {
+                                if let Err(e) = open_in_browser(&flow.authorize_url) {
+                                    sender.input(Msg::OauthOpenAiFailed(format!(
+                                        "no se pudo abrir el navegador: {e}"
+                                    )));
+                                    return;
+                                }
+                                match flow.await_completion().await {
+                                    Ok(info) => sender.input(Msg::OauthOpenAiCompleted(info)),
+                                    Err(e) => sender.input(Msg::OauthOpenAiFailed(e.to_string())),
+                                }
+                            }
+                            Err(e) => sender.input(Msg::OauthOpenAiFailed(e.to_string())),
+                        }
+                    });
+                }
+                other => {
+                    // Para proveedores sin flujo OAuth, ofrecer entrada manual
+                    // de API key. Esta es la rama por defecto y la única hoy
+                    // disponible para todo lo que no sea OpenAI.
+                    let provider_id = other.to_string();
+                    let provider_id_for_closure = provider_id.clone();
+                    let auth = self.engine.auth().clone();
+                    let sender_dialog = sender.clone();
+                    show_api_key_dialog(root, &provider_id, move |key| {
+                        let auth = auth.clone();
+                        let provider_id = provider_id_for_closure.clone();
+                        let sender = sender_dialog.clone();
+                        relm4::spawn(async move {
+                            if let Err(e) = auth
+                                .set(
+                                    provider_id.clone(),
+                                    AuthInfo::Api {
+                                        key,
+                                        metadata: None,
+                                    },
+                                )
+                                .await
+                            {
+                                sender.input(Msg::Failed(format!("auth: {e}")));
+                                return;
+                            }
+                            sender.input(Msg::Toast(format!("Cuenta «{provider_id}» conectada")));
+                        });
+                    });
+                }
+            },
+
+            Msg::OauthOpenAiCompleted(info) => {
+                let auth = self.engine.auth().clone();
+                let sender = sender.clone();
+                relm4::spawn(async move {
+                    if let Err(e) = auth.set("openai", info).await {
+                        sender.input(Msg::Failed(format!("auth: {e}")));
+                        return;
+                    }
+                    sender.input(Msg::Toast("Cuenta OpenAI conectada".to_string()));
+                });
+            }
+
+            Msg::OauthOpenAiFailed(err) => {
+                append_bubble(
+                    &widgets.chat_list,
+                    Role::System,
+                    &format!("La conexión con OpenAI falló: {err}"),
+                );
+            }
+
+            Msg::DisconnectProvider(provider_id) => {
+                let auth = self.engine.auth().clone();
+                let sender = sender.clone();
+                let id = provider_id.clone();
+                relm4::spawn(async move {
+                    if let Err(e) = auth.remove(&id).await {
+                        sender.input(Msg::Failed(format!("auth: {e}")));
+                        return;
+                    }
+                    sender.input(Msg::Toast(format!("«{id}» desconectado")));
+                });
             }
 
             Msg::Renamed { id, title } => {
@@ -1995,6 +2141,283 @@ fn show_model_picker_dialog(
     });
 
     dialog.present();
+}
+
+/// Acción que el modal de Configuración devuelve al callback.
+enum SettingsAction {
+    Connect,
+    Disconnect(String),
+}
+
+/// Modal "Configuración". Muestra las cuentas conectadas con un botón de
+/// desconectar por fila y un botón general "Conectar proveedor" abajo.
+fn show_settings_dialog(
+    parent: &adw::ApplicationWindow,
+    connected: &[(String, String)],
+    on_action: impl Fn(SettingsAction) + 'static,
+) {
+    let on_action = Rc::new(on_action);
+    let dialog = adw::MessageDialog::new(Some(parent), Some("Configuración"), None);
+    dialog.add_response("close", "Cerrar");
+    dialog.set_default_response(Some("close"));
+    dialog.set_close_response("close");
+
+    let container = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    container.set_size_request(420, -1);
+    container.set_margin_top(4);
+
+    let section_title = gtk::Label::new(Some("Cuentas"));
+    section_title.set_xalign(0.0);
+    section_title.add_css_class("heading");
+    container.append(&section_title);
+
+    let list = gtk::ListBox::new();
+    list.add_css_class("boxed-list");
+    list.set_selection_mode(gtk::SelectionMode::None);
+    if connected.is_empty() {
+        let row = gtk::ListBoxRow::new();
+        row.set_selectable(false);
+        let label = gtk::Label::new(Some(
+            "No hay cuentas conectadas. Pulsa «Conectar proveedor» para empezar.",
+        ));
+        label.set_xalign(0.0);
+        label.set_wrap(true);
+        label.set_margin_top(10);
+        label.set_margin_bottom(10);
+        label.set_margin_start(12);
+        label.set_margin_end(12);
+        row.set_child(Some(&label));
+        list.append(&row);
+    } else {
+        for (id, kind) in connected {
+            let row = gtk::ListBoxRow::new();
+            row.set_selectable(false);
+            let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            hbox.set_margin_top(8);
+            hbox.set_margin_bottom(8);
+            hbox.set_margin_start(12);
+            hbox.set_margin_end(8);
+            let label = gtk::Label::new(Some(&format!("{id} · {kind}")));
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            hbox.append(&label);
+            let disconnect = gtk::Button::with_label("Desconectar");
+            disconnect.add_css_class("flat");
+            disconnect.add_css_class("destructive-action");
+            let id_clone = id.clone();
+            let dialog_for_close = dialog.clone();
+            let on_action_clone = on_action.clone();
+            disconnect.connect_clicked(move |_| {
+                on_action_clone(SettingsAction::Disconnect(id_clone.clone()));
+                dialog_for_close.close();
+            });
+            hbox.append(&disconnect);
+            row.set_child(Some(&hbox));
+            list.append(&row);
+        }
+    }
+    container.append(&list);
+
+    let connect = gtk::Button::with_label("Conectar proveedor");
+    connect.add_css_class("suggested-action");
+    let on_action_for_connect = on_action.clone();
+    let dialog_for_connect = dialog.clone();
+    connect.connect_clicked(move |_| {
+        on_action_for_connect(SettingsAction::Connect);
+        dialog_for_connect.close();
+    });
+    container.append(&connect);
+
+    dialog.set_extra_child(Some(&container));
+    dialog.present();
+}
+
+/// Modal "Conectar proveedor". Lista los proveedores del catálogo y al
+/// confirmar invoca `on_select(provider_id)`. OpenAI dispara el flujo OAuth;
+/// el resto cae a entrada manual de API key.
+fn show_connect_provider_dialog(
+    parent: &adw::ApplicationWindow,
+    providers: &[(String, String)],
+    on_select: impl Fn(String) + 'static,
+) {
+    let dialog = adw::MessageDialog::new(Some(parent), Some("Conectar proveedor"), None);
+    dialog.add_response("cancel", "Cancelar");
+    dialog.add_response("apply", "Continuar");
+    dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("apply"));
+    dialog.set_close_response("cancel");
+
+    let container = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    container.set_size_request(420, -1);
+    container.set_margin_top(4);
+
+    let search = gtk::SearchEntry::new();
+    search.set_placeholder_text(Some("Buscar proveedor…"));
+    container.append(&search);
+
+    let scroller = gtk::ScrolledWindow::new();
+    scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
+    scroller.set_propagate_natural_height(true);
+    scroller.set_min_content_height(320);
+    scroller.set_max_content_height(420);
+
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::Single);
+    list.add_css_class("boxed-list");
+
+    // Pone OpenAI primero (es el único con OAuth implementado) y el resto en
+    // orden del catálogo. Una pequeña etiqueta indica el método disponible.
+    let mut sorted: Vec<&(String, String)> = providers.iter().collect();
+    sorted.sort_by_key(|(id, _)| if id == "openai" { 0 } else { 1 });
+
+    let values: Rc<Vec<String>> = Rc::new(sorted.iter().map(|(id, _)| id.clone()).collect());
+    for (idx, (id, name)) in sorted.iter().enumerate() {
+        let row = gtk::ListBoxRow::new();
+        let hbox = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        hbox.set_margin_top(8);
+        hbox.set_margin_bottom(8);
+        hbox.set_margin_start(12);
+        hbox.set_margin_end(12);
+        let title = gtk::Label::new(Some(name));
+        title.set_xalign(0.0);
+        title.add_css_class("heading");
+        hbox.append(&title);
+        let subtitle = gtk::Label::new(Some(if id == "openai" {
+            "OAuth (cuenta ChatGPT Pro/Plus)"
+        } else {
+            "API key"
+        }));
+        subtitle.set_xalign(0.0);
+        subtitle.add_css_class("dim-label");
+        hbox.append(&subtitle);
+        row.set_child(Some(&hbox));
+        let needle: Rc<String> = Rc::new(format!("{} {}", id, name).to_lowercase());
+        unsafe {
+            row.set_data::<usize>("idx", idx);
+            row.set_data::<Rc<String>>("needle", needle);
+        }
+        list.append(&row);
+    }
+    if let Some(first) = list.row_at_index(0) {
+        list.select_row(Some(&first));
+    }
+
+    {
+        let search_for_filter = search.clone();
+        list.set_filter_func(move |row| {
+            let needle = search_for_filter.text().to_string();
+            if needle.is_empty() {
+                return true;
+            }
+            let needle = needle.to_lowercase();
+            unsafe { row.data::<Rc<String>>("needle") }
+                .map(|ptr| {
+                    let s = unsafe { ptr.as_ref() };
+                    s.contains(&needle)
+                })
+                .unwrap_or(true)
+        });
+        let list_for_search = list.clone();
+        search.connect_search_changed(move |_| {
+            list_for_search.invalidate_filter();
+        });
+    }
+
+    scroller.set_child(Some(&list));
+    container.append(&scroller);
+    dialog.set_extra_child(Some(&container));
+
+    {
+        let dialog_for_activate = dialog.clone();
+        list.connect_row_activated(move |list, row| {
+            list.select_row(Some(row));
+            dialog_for_activate.response("apply");
+        });
+    }
+
+    let list_for_response = list.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "apply" {
+            return;
+        }
+        let Some(row) = list_for_response.selected_row() else {
+            return;
+        };
+        let Some(ptr) = (unsafe { row.data::<usize>("idx") }) else {
+            return;
+        };
+        let idx = unsafe { *ptr.as_ref() };
+        if let Some(id) = values.get(idx) {
+            on_select(id.clone());
+        }
+    });
+
+    dialog.present();
+}
+
+/// Modal de espera del callback OAuth. Solo informativo: el callback llega
+/// al servidor local y dispara `OauthOpenAiCompleted` / `OauthOpenAiFailed`,
+/// que muestran un toast / mensaje en el chat.
+fn show_oauth_waiting_dialog(parent: &adw::ApplicationWindow) {
+    let dialog = adw::MessageDialog::new(
+        Some(parent),
+        Some("Conectando con OpenAI"),
+        Some(
+            "Se ha abierto tu navegador para completar la autorización. \
+             Vuelve a esta ventana cuando termines; te avisaremos del resultado.\n\n\
+             Si nada se abre, copia esta URL en el navegador manualmente:\n\
+             http://127.0.0.1:1455/auth/callback",
+        ),
+    );
+    dialog.add_response("close", "Entendido");
+    dialog.set_default_response(Some("close"));
+    dialog.set_close_response("close");
+    dialog.present();
+}
+
+/// Modal de entrada manual de API key para un proveedor.
+fn show_api_key_dialog(
+    parent: &adw::ApplicationWindow,
+    provider_id: &str,
+    on_confirm: impl Fn(String) + 'static,
+) {
+    let dialog = adw::MessageDialog::new(
+        Some(parent),
+        Some(&format!("API key · {provider_id}")),
+        Some("Pega aquí tu API key. Se guardará en auth.json con permisos 0600."),
+    );
+    dialog.add_response("cancel", "Cancelar");
+    dialog.add_response("save", "Guardar");
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("save"));
+    dialog.set_close_response("cancel");
+
+    let entry = gtk::PasswordEntry::new();
+    entry.set_show_peek_icon(true);
+    entry.set_margin_top(6);
+    dialog.set_extra_child(Some(&entry));
+
+    let entry_for_response = entry.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "save" {
+            return;
+        }
+        let text = entry_for_response.text().trim().to_string();
+        if !text.is_empty() {
+            on_confirm(text);
+        }
+    });
+    dialog.present();
+}
+
+/// Lanza `xdg-open` (Linux) para abrir una URL en el navegador del usuario.
+fn open_in_browser(url: &str) -> std::io::Result<()> {
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
 }
 
 /// Diálogo destructivo de confirmación para eliminar una sesión.

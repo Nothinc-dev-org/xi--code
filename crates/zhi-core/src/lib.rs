@@ -24,8 +24,8 @@ use futures::{Stream, StreamExt};
 pub use snapshot::Snapshots;
 pub use store::{SessionMeta, Store};
 pub use zhi_provider::{
-    catalog as catalog_internals, Catalog, EventStream, Message, ModelInfo, ModelRef, ModelStatus,
-    Provider, ProviderInfo, Role, StreamEvent, ToolCall,
+    catalog as catalog_internals, oauth, AuthInfo, AuthStore, Catalog, EventStream, Message,
+    ModelInfo, ModelRef, ModelStatus, Provider, ProviderInfo, Role, StreamEvent, ToolCall,
 };
 pub use zhi_tool::{ToolContext, ToolRegistry};
 
@@ -46,8 +46,10 @@ pub enum Error {
     Snapshot(String),
     #[error("modelo desconocido en el catálogo: {0}")]
     UnknownModel(String),
-    #[error("falta la variable de entorno {env_var} para usar el modelo «{model}»")]
+    #[error("falta credencial para usar el modelo «{model}»: registra una API key en Configuración o exporta {env_var}")]
     MissingApiKey { env_var: String, model: String },
+    #[error("la cuenta ChatGPT está conectada pero el cliente Codex Responses API todavía no está implementado; usa una API key clásica para «{model}» mientras tanto")]
+    OauthInferenceNotImplemented { model: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -200,16 +202,19 @@ pub type AgentStream = Pin<Box<dyn Stream<Item = Result<AgentEvent>> + Send>>;
 #[derive(Clone)]
 pub struct Engine {
     catalog: Arc<Catalog>,
+    auth: AuthStore,
     providers: Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>,
     tools: ToolRegistry,
 }
 
 impl Engine {
-    /// Construye el motor sobre el catálogo dado. El catálogo se asume ya
-    /// filtrado a proveedores compatibles (`Catalog::openai_compatible`).
-    pub fn new(catalog: Arc<Catalog>) -> Self {
+    /// Construye el motor sobre el catálogo y el almacén de credenciales. El
+    /// catálogo se asume ya filtrado a proveedores compatibles
+    /// (`Catalog::openai_compatible`).
+    pub fn new(catalog: Arc<Catalog>, auth: AuthStore) -> Self {
         Self {
             catalog,
+            auth,
             providers: Arc::new(Mutex::new(HashMap::new())),
             tools: ToolRegistry::with_builtins(),
         }
@@ -220,10 +225,22 @@ impl Engine {
         &self.catalog
     }
 
+    /// Almacén de credenciales activo (compartido con la UI de Settings).
+    pub fn auth(&self) -> &AuthStore {
+        &self.auth
+    }
+
     /// Resuelve el cliente del proveedor asociado al modelo, construyéndolo y
-    /// cacheándolo si es la primera vez. Devuelve [`Error::UnknownModel`] si el
-    /// modelo no está en el catálogo, o [`Error::MissingApiKey`] si la variable
-    /// de entorno del proveedor no está definida.
+    /// cacheándolo si es la primera vez.
+    ///
+    /// Orden de prioridad para obtener la credencial:
+    /// 1. `AuthStore` con [`AuthInfo::Api`] para ese proveedor.
+    /// 2. `AuthStore` con [`AuthInfo::Oauth`] → por ahora devuelve
+    ///    [`Error::OauthInferenceNotImplemented`] (los tokens quedan
+    ///    guardados pero el cliente Codex Responses API aún no existe; ver
+    ///    ADR-0010).
+    /// 3. Variable de entorno declarada por el proveedor en el catálogo.
+    /// 4. Ninguna → [`Error::MissingApiKey`].
     fn provider_for(&self, model_ref: &ModelRef) -> Result<Arc<dyn Provider>> {
         let (provider, _) = self
             .catalog
@@ -239,14 +256,26 @@ impl Engine {
         if let Some(p) = providers.get(&provider.id) {
             return Ok(p.clone());
         }
-        let env_var = provider.env_var().ok_or_else(|| Error::MissingApiKey {
-            env_var: String::new(),
-            model: model_ref.to_string(),
-        })?;
-        let key = std::env::var(env_var).map_err(|_| Error::MissingApiKey {
-            env_var: env_var.to_string(),
-            model: model_ref.to_string(),
-        })?;
+
+        let key = match self.auth.get(&provider.id) {
+            Some(AuthInfo::Api { key, .. }) => key,
+            Some(AuthInfo::Oauth { .. }) => {
+                return Err(Error::OauthInferenceNotImplemented {
+                    model: model_ref.to_string(),
+                });
+            }
+            None => {
+                let env_var = provider.env_var().ok_or_else(|| Error::MissingApiKey {
+                    env_var: String::new(),
+                    model: model_ref.to_string(),
+                })?;
+                std::env::var(env_var).map_err(|_| Error::MissingApiKey {
+                    env_var: env_var.to_string(),
+                    model: model_ref.to_string(),
+                })?
+            }
+        };
+
         let client: Arc<dyn Provider> =
             Arc::new(zhi_provider::OpenAiCompatible::new(key, base_url));
         providers.insert(provider.id.clone(), client.clone());

@@ -10,16 +10,19 @@
 > system prompt y filtra las tools ofrecidas al modelo (Fase 4). Persistido por
 > sesión en la columna `agent` de `sessions`. Ver
 > [ADR-0007](../../docs/decisions/0007-tools-permisos-bucle-agente.md).
-> **Engine multi-proveedor**: `new(Arc<Catalog>)` infalible; mapa perezoso
-> `HashMap<provider_id, Arc<dyn Provider>>` que se resuelve por `ModelRef`
-> (`Catalog::resolve`) en cada turno. La falta de clave es
-> `Error::MissingApiKey { env_var, model }` emitida por el stream. El
-> catálogo viene de `models.dev` (snapshot embebido + cache + refresh
-> background; filtrado a OpenAI-compatible). El modelo se persiste como
-> `provider/model`; los ids legacy se resuelven con `resolve_legacy`. Ver
+> **Engine multi-proveedor**: `new(Arc<Catalog>, AuthStore)` infalible; mapa
+> perezoso `HashMap<provider_id, Arc<dyn Provider>>` que se resuelve por
+> `ModelRef` (`Catalog::resolve`) en cada turno. Prioridad de credencial:
+> 1) `AuthStore` con `Api { key }`, 2) `AuthStore` con `Oauth { .. }` →
+> hoy `Error::OauthInferenceNotImplemented` (follow-up: cliente Codex
+> Responses API), 3) env var del proveedor, 4) `MissingApiKey`. Catálogo
+> de `models.dev` (snapshot embebido + cache + refresh background; filtrado
+> a OpenAI-compatible). El modelo se persiste como `provider/model`; los ids
+> legacy se resuelven con `resolve_legacy`. Ver
 > [ADR-0008](../../docs/decisions/0008-multi-proveedor-catalogo-estatico.md)
-> (Engine infalible) y [ADR-0009](../../docs/decisions/0009-catalogo-models-dev.md)
-> (catálogo dinámico).
+> (Engine infalible), [ADR-0009](../../docs/decisions/0009-catalogo-models-dev.md)
+> (catálogo dinámico) y [ADR-0010](../../docs/decisions/0010-auth-oauth-openai.md)
+> (auth/OAuth).
 > Pendiente: subagentes, agentes personalizados desde config.
 
 ## Responsabilidad

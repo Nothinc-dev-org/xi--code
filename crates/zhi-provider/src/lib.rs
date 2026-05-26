@@ -6,7 +6,9 @@
 //! proveedores/modelos que la app conoce vive en [`catalog`], poblado desde
 //! `models.dev` (snapshot embebido + cache + refresh; ver `ADR-0009`).
 
+pub mod auth;
 pub mod catalog;
+pub mod oauth;
 
 use std::pin::Pin;
 
@@ -14,6 +16,7 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 
+pub use auth::{AuthInfo, AuthStore};
 pub use catalog::{Catalog, ModelInfo, ModelRef, ModelStatus, ProviderInfo, OPENAI_COMPATIBLE_NPM};
 
 /// Error del crate. Cada proveedor mapea sus fallos a estas variantes.
@@ -23,6 +26,10 @@ pub enum Error {
     Http(#[from] reqwest::Error),
     #[error("error decodificando la respuesta del proveedor: {0}")]
     Decode(#[from] serde_json::Error),
+    #[error("error de auth: {0}")]
+    Auth(String),
+    #[error("error del flujo OAuth: {0}")]
+    Oauth(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
