@@ -19,11 +19,20 @@ pub enum Block {
     },
 }
 
+#[derive(Default)]
+struct TableState {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    current_row: Vec<String>,
+    current_cell: String,
+    in_head: bool,
+}
+
 pub fn parse_blocks(markdown: &str) -> Vec<Block> {
     let mut out: Vec<Block> = Vec::new();
     let mut prose = String::new();
     let mut code: Option<(Option<String>, String)> = None;
-    let mut table: Option<(Vec<String>, Vec<Vec<String>>, Vec<String>, String)> = None;
+    let mut table: Option<TableState> = None;
 
     let flush_prose = |prose: &mut String, out: &mut Vec<Block>| {
         let trimmed = prose.trim_end();
@@ -50,37 +59,54 @@ pub fn parse_blocks(markdown: &str) -> Vec<Block> {
             continue;
         }
 
-        if let Some((headers, rows, current_row, current_cell)) = table.as_mut() {
-            match event {
-                Event::Start(Tag::TableHead) => {
-                    current_row.clear();
+        if table.is_some() {
+            let mut finish_table = false;
+            if let Some(state) = table.as_mut() {
+                match event {
+                    Event::Start(Tag::TableHead) => {
+                        state.in_head = true;
+                        state.current_row.clear();
+                    }
+                    Event::Start(Tag::TableRow) => {
+                        state.current_row.clear();
+                    }
+                    Event::Start(Tag::TableCell) => {
+                        state.current_cell.clear();
+                    }
+                    Event::End(TagEnd::TableHead) => {
+                        state.in_head = false;
+                    }
+                    Event::End(TagEnd::TableRow) => {
+                        let row = std::mem::take(&mut state.current_row);
+                        if state.in_head {
+                            state.headers = row;
+                        } else {
+                            state.rows.push(row);
+                        }
+                    }
+                    Event::End(TagEnd::TableCell) => {
+                        state
+                            .current_row
+                            .push(std::mem::take(&mut state.current_cell));
+                    }
+                    Event::End(TagEnd::Table) => {
+                        finish_table = true;
+                    }
+                    Event::Text(t) => {
+                        state.current_cell.push_str(&t);
+                    }
+                    Event::Code(c) => {
+                        state.current_cell.push_str(&c);
+                    }
+                    _ => {}
                 }
-                Event::Start(Tag::TableRow) => {
-                    current_row.clear();
-                }
-                Event::Start(Tag::TableCell) => {
-                    current_cell.clear();
-                }
-                Event::End(TagEnd::TableHead) => {
-                    headers.extend(current_row.drain(..));
-                }
-                Event::End(TagEnd::TableRow) => {
-                    rows.push(std::mem::take(current_row));
-                }
-                Event::End(TagEnd::TableCell) => {
-                    current_row.push(std::mem::take(current_cell));
-                }
-                Event::End(TagEnd::Table) => {
-                    let (headers, rows, _, _) = table.take().unwrap();
-                    out.push(Block::Table { headers, rows });
-                }
-                Event::Text(t) => {
-                    current_cell.push_str(&t);
-                }
-                Event::Code(c) => {
-                    current_cell.push_str(&c);
-                }
-                _ => {}
+            }
+            if finish_table {
+                let state = table.take().unwrap();
+                out.push(Block::Table {
+                    headers: state.headers,
+                    rows: state.rows,
+                });
             }
             continue;
         }
@@ -97,7 +123,7 @@ pub fn parse_blocks(markdown: &str) -> Vec<Block> {
 
             Event::Start(Tag::Table(_)) => {
                 flush_prose(&mut prose, &mut out);
-                table = Some((Vec::new(), Vec::new(), Vec::new(), String::new()));
+                table = Some(TableState::default());
             }
 
             Event::Start(Tag::Strong) => prose.push_str("<b>"),
