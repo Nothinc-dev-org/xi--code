@@ -10,7 +10,7 @@
 mod markdown;
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -27,6 +27,8 @@ use zhi_core::{
 const APP_ID: &str = "ai.xiecode.App";
 /// Máximo de caracteres mostrados de la salida de una tool (la UI no es un visor).
 const TOOL_OUTPUT_MAX: usize = 4000;
+const CHANGES_PANEL_BREAKPOINT: i32 = 1180;
+const CHANGES_PANEL_WIDTH: i32 = 420;
 
 struct App {
     /// Motor del agente. Existe siempre: la falta de credenciales se reporta al
@@ -76,6 +78,16 @@ struct App {
     /// `message_id` (DB) → `hash`. Repoblado al cargar una sesión y extendido
     /// tras cada turno.
     message_snapshots: HashMap<i64, String>,
+    /// Primer snapshot con cambios de la sesión activa; base para el panel de cambios.
+    session_base_snapshot: Option<String>,
+    /// Diff renderizable del worktree actual respecto a `session_base_snapshot`.
+    changes_patch: String,
+    /// Índice del archivo actualmente enfocado en el nav del panel de cambios.
+    changes_nav_index: usize,
+    /// Rutas de los archivos del diff actual, para el nav.
+    changes_nav_files: Vec<String>,
+    /// `true` si el viewport tiene espacio para mostrar chat + cambios.
+    wide_layout: bool,
     /// Texto acumulado del segmento de texto en curso (markdown sin renderizar).
     partial: String,
     /// Visibilidad global del *chain of thought*. Solo aplica si el modelo
@@ -94,6 +106,8 @@ struct App {
     /// emite el motor. Al persistir el `TurnFinished` se asignan a los
     /// mensajes de asistente que llevan `reasoning` por orden de aparición.
     reasoning_ms_queue: Vec<u64>,
+    sessions_sidebar_collapsed: bool,
+    command_palette_dialog: Option<adw::MessageDialog>,
     /// Timeout activo que oculta el toast. Si llega un toast nuevo antes de
     /// que dispare, se cancela el anterior para reiniciar el contador.
     toast_timeout: Option<gtk::glib::SourceId>,
@@ -145,6 +159,8 @@ enum Msg {
     },
     /// Crear una sesión nueva.
     NewSession,
+    /// Colapsar/des-colapsar el sidebar de sesiones.
+    ToggleSessionsSidebar,
     /// Se creó una sesión nueva.
     SessionCreated(SessionMeta),
     /// El usuario pidió eliminar una sesión desde el menú contextual del sidebar.
@@ -162,6 +178,10 @@ enum Msg {
     ToggleAgent,
     /// El usuario pulsó el botón de modelo de la top toolbar.
     OpenModelPicker,
+    /// El usuario abrió la paleta de comandos (Ctrl+P).
+    OpenCommandPalette,
+    /// La paleta de comandos se cerró.
+    CommandPaletteClosed,
     /// El usuario seleccionó un modelo en el modal.
     ModelChanged(String),
     /// El usuario pulsó el botón de configuración (icono).
@@ -192,6 +212,14 @@ enum Msg {
     /// El snapshot del último turno ya está persistido bajo `message_id`;
     /// listo para colgar el botón "Revertir" de la última tarjeta del paso.
     SnapshotPersisted { message_id: i64, hash: String },
+    /// Llegó el diff del worktree respecto a la base de cambios de la sesión.
+    ChangesPatchLoaded(String),
+    /// Navegar al archivo anterior en el panel de cambios.
+    ChangesNavPrev,
+    /// Navegar al archivo siguiente en el panel de cambios.
+    ChangesNavNext,
+    /// Cambió el ancho disponible de la ventana.
+    WindowWidthChanged(i32),
     /// El agente va a ejecutar una tool.
     ToolStarted { name: String, arguments: String },
     /// Una tool terminó con su salida.
@@ -213,6 +241,17 @@ enum Msg {
     Failed(String),
     /// Muestra un toast flotante (centro-arriba) durante ~1.6 s.
     Toast(String),
+    /// Cerrar la aplicación.
+    Quit,
+}
+
+#[derive(Clone, Copy)]
+enum CommandPaletteAction {
+    SelectModel,
+    ConnectProvider,
+    NewSession,
+    ToggleThinking,
+    Quit,
 }
 
 /// Resolver de permisos respaldado por la UI: envía la solicitud al hilo de GLib
@@ -283,40 +322,72 @@ impl Component for App {
                     set_orientation: gtk::Orientation::Horizontal,
 
                 // ── Sidebar de sesiones ──────────────────────────────────────
+                #[name = "sessions_sidebar"]
                 gtk::Box {
                     set_orientation: gtk::Orientation::Vertical,
-                    set_size_request: (260, -1),
+                    set_hexpand: false,
 
-                    adw::HeaderBar {
-                        // Los controles de ventana (min/max/cerrar) viven solo en
-                        // la cabecera del área de conversación, no en el sidebar.
-                        set_show_start_title_buttons: false,
-                        set_show_end_title_buttons: false,
-                        #[wrap(Some)]
-                        set_title_widget = &adw::WindowTitle {
-                            set_title: "Sesiones",
-                        },
-                        pack_start = &gtk::Button {
-                            set_icon_name: "list-add-symbolic",
-                            set_tooltip_text: Some("Nueva sesión"),
+                    #[name = "sessions_sidebar_collapsed"]
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                        set_visible: false,
+
+                        gtk::Button {
+                            set_icon_name: "sidebar-show-symbolic",
+                            add_css_class: "flat",
+                            set_margin_top: 6,
+                            set_margin_start: 6,
+                            set_margin_end: 6,
+                            set_tooltip_text: Some("Mostrar sesiones"),
                             connect_clicked[sender] => move |_| {
-                                sender.input(Msg::NewSession);
+                                sender.input(Msg::ToggleSessionsSidebar);
                             },
                         },
                     },
 
-                    gtk::ScrolledWindow {
-                        set_vexpand: true,
-                        set_hscrollbar_policy: gtk::PolicyType::Never,
+                    #[name = "sessions_sidebar_expanded"]
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
 
-                        #[name = "session_list"]
-                        gtk::ListBox {
-                            set_selection_mode: gtk::SelectionMode::Single,
-                            add_css_class: "navigation-sidebar",
-                            connect_row_selected[sender] => move |_, row| {
-                                if let Some(row) = row {
-                                    sender.input(Msg::SelectIndex(row.index()));
-                                }
+                        adw::HeaderBar {
+                            // Los controles de ventana (min/max/cerrar) viven solo en
+                            // la cabecera del área de conversación, no en el sidebar.
+                            set_show_start_title_buttons: false,
+                            set_show_end_title_buttons: false,
+                            #[wrap(Some)]
+                            set_title_widget = &adw::WindowTitle {
+                                set_title: "Sesiones",
+                            },
+                            pack_start = &gtk::Button {
+                                set_icon_name: "list-add-symbolic",
+                                set_tooltip_text: Some("Nueva sesión"),
+                                connect_clicked[sender] => move |_| {
+                                    sender.input(Msg::NewSession);
+                                },
+                            },
+                            pack_end = &gtk::Button {
+                                set_icon_name: "sidebar-show-right-symbolic",
+                                add_css_class: "flat",
+                                set_tooltip_text: Some("Ocultar sesiones"),
+                                connect_clicked[sender] => move |_| {
+                                    sender.input(Msg::ToggleSessionsSidebar);
+                                },
+                            },
+                        },
+
+                        gtk::ScrolledWindow {
+                            set_vexpand: true,
+                            set_hscrollbar_policy: gtk::PolicyType::Never,
+
+                            #[name = "session_list"]
+                            gtk::ListBox {
+                                set_selection_mode: gtk::SelectionMode::Single,
+                                add_css_class: "navigation-sidebar",
+                                connect_row_selected[sender] => move |_, row| {
+                                    if let Some(row) = row {
+                                        sender.input(Msg::SelectIndex(row.index()));
+                                    }
+                                },
                             },
                         },
                     },
@@ -389,88 +460,190 @@ impl Component for App {
                         set_orientation: gtk::Orientation::Horizontal,
                     },
 
-                    #[name = "scroller"]
-                    gtk::ScrolledWindow {
-                        set_vexpand: true,
-                        set_hscrollbar_policy: gtk::PolicyType::Never,
-
-                        #[name = "chat_list"]
-                        #[wrap(Some)]
-                        set_child = &gtk::Box {
-                            set_orientation: gtk::Orientation::Vertical,
-                            set_spacing: 16,
-                            set_margin_all: 16,
-                        },
-                    },
+                gtk::Box {
+                    set_orientation: gtk::Orientation::Horizontal,
+                    set_vexpand: true,
 
                     gtk::Box {
-                        set_orientation: gtk::Orientation::Horizontal,
-                        set_spacing: 6,
-                        set_margin_all: 12,
+                        set_orientation: gtk::Orientation::Vertical,
+                        set_hexpand: true,
+
+                        #[name = "scroller"]
+                        gtk::ScrolledWindow {
+                            set_vexpand: true,
+                            set_hscrollbar_policy: gtk::PolicyType::Automatic,
+
+                            #[name = "chat_list"]
+                            #[wrap(Some)]
+                            set_child = &gtk::Box {
+                                set_orientation: gtk::Orientation::Vertical,
+                                set_spacing: 16,
+                                set_margin_all: 16,
+                            },
+                        },
 
                         gtk::Box {
                             set_orientation: gtk::Orientation::Horizontal,
-                            add_css_class: "linked",
+                            set_spacing: 6,
+                            set_margin_all: 12,
 
-                            #[name = "agent_build"]
-                            gtk::ToggleButton {
-                                set_label: "Build",
-                                set_active: true,
-                                add_css_class: "agent-build",
-                                set_tooltip_text: Some(
-                                    "Acceso completo: lee, escribe, ejecuta (Shift+Tab para alternar)",
-                                ),
-                                connect_toggled[sender] => move |b| {
-                                    if b.is_active() {
-                                        sender.input(Msg::AgentChanged(AgentKind::Build));
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Horizontal,
+                                add_css_class: "linked",
+
+                                #[name = "agent_build"]
+                                gtk::ToggleButton {
+                                    set_label: "Build",
+                                    set_active: true,
+                                    add_css_class: "agent-build",
+                                    set_tooltip_text: Some(
+                                        "Acceso completo: lee, escribe, ejecuta (Shift+Tab para alternar)",
+                                    ),
+                                    connect_toggled[sender] => move |b| {
+                                        if b.is_active() {
+                                            sender.input(Msg::AgentChanged(AgentKind::Build));
+                                        }
+                                    },
+                                },
+
+                                #[name = "agent_plan"]
+                                gtk::ToggleButton {
+                                    set_label: "Plan",
+                                    add_css_class: "agent-plan",
+                                    set_tooltip_text: Some(
+                                        "Solo lectura: lee y propone, no modifica (Shift+Tab para alternar)",
+                                    ),
+                                    connect_toggled[sender] => move |b| {
+                                        if b.is_active() {
+                                            sender.input(Msg::AgentChanged(AgentKind::Plan));
+                                        }
+                                    },
+                                },
+                            },
+
+                            #[name = "entry"]
+                            gtk::Entry {
+                                set_hexpand: true,
+                                set_placeholder_text: Some("Escribe un mensaje…"),
+                                connect_activate[sender] => move |entry| {
+                                    let text = entry.text().trim().to_string();
+                                    if !text.is_empty() {
+                                        sender.input(Msg::Send(text));
+                                        entry.set_text("");
                                     }
                                 },
                             },
 
-                            #[name = "agent_plan"]
-                            gtk::ToggleButton {
-                                set_label: "Plan",
-                                add_css_class: "agent-plan",
-                                set_tooltip_text: Some(
-                                    "Solo lectura: lee y propone, no modifica (Shift+Tab para alternar)",
-                                ),
-                                connect_toggled[sender] => move |b| {
-                                    if b.is_active() {
-                                        sender.input(Msg::AgentChanged(AgentKind::Plan));
+                            #[name = "send_button"]
+                            gtk::Button {
+                                set_label: "Enviar",
+                                add_css_class: "suggested-action",
+                                connect_clicked[sender, entry] => move |_| {
+                                    let text = entry.text().trim().to_string();
+                                    if !text.is_empty() {
+                                        sender.input(Msg::Send(text));
+                                        entry.set_text("");
                                     }
                                 },
                             },
                         },
+                    },
 
-                        #[name = "entry"]
-                        gtk::Entry {
-                            set_hexpand: true,
-                            set_placeholder_text: Some("Escribe un mensaje…"),
-                            connect_activate[sender] => move |entry| {
-                                let text = entry.text().trim().to_string();
-                                if !text.is_empty() {
-                                    sender.input(Msg::Send(text));
-                                    entry.set_text("");
-                                }
+                    #[name = "changes_separator"]
+                    gtk::Separator {
+                        set_orientation: gtk::Orientation::Vertical,
+                        set_visible: false,
+                    },
+
+                    // ── Panel de cambios ─────────────────────────────────────
+                    #[name = "changes_panel"]
+                    gtk::Revealer {
+                        set_transition_type: gtk::RevealerTransitionType::SlideLeft,
+                        set_transition_duration: 180,
+                        set_reveal_child: false,
+                        set_visible: false,
+
+                        #[wrap(Some)]
+                        set_child = &gtk::Box {
+                            set_orientation: gtk::Orientation::Vertical,
+                            set_size_request: (CHANGES_PANEL_WIDTH, -1),
+
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Horizontal,
+                                set_margin_top: 8,
+                                set_margin_bottom: 8,
+                                set_margin_start: 12,
+                                set_margin_end: 12,
+
+                                gtk::Label {
+                                    set_label: "Cambios",
+                                    add_css_class: "heading",
+                                },
                             },
-                        },
 
-                        #[name = "send_button"]
-                        gtk::Button {
-                            set_label: "Enviar",
-                            add_css_class: "suggested-action",
-                            connect_clicked[sender, entry] => move |_| {
-                                let text = entry.text().trim().to_string();
-                                if !text.is_empty() {
-                                    sender.input(Msg::Send(text));
-                                    entry.set_text("");
-                                }
+                            gtk::Separator {
+                                set_orientation: gtk::Orientation::Horizontal,
+                            },
+
+                            gtk::Overlay {
+                                gtk::ScrolledWindow {
+                                    set_vexpand: true,
+                                    set_hscrollbar_policy: gtk::PolicyType::Automatic,
+
+                                    #[name = "changes_list"]
+                                    #[wrap(Some)]
+                                    set_child = &gtk::Box {
+                                        set_orientation: gtk::Orientation::Vertical,
+                                        set_hexpand: true,
+                                        set_spacing: 8,
+                                        set_margin_all: 12,
+                                        set_margin_bottom: 20,
+                                    },
+                                },
+
+                                #[name = "changes_nav_bar"]
+                                add_overlay = &gtk::Box {
+                                    set_orientation: gtk::Orientation::Horizontal,
+                                    set_halign: gtk::Align::Center,
+                                    set_valign: gtk::Align::Start,
+                                    set_margin_top: 6,
+                                    set_spacing: 4,
+                                    add_css_class: "changes-nav-bar",
+                                    set_visible: false,
+
+                                    #[name = "changes_nav_prev"]
+                                    gtk::Button {
+                                        set_icon_name: "go-previous-symbolic",
+                                        add_css_class: "flat",
+                                        add_css_class: "circular",
+                                        connect_clicked[sender] => move |_| {
+                                            sender.input(Msg::ChangesNavPrev);
+                                        },
+                                    },
+
+                                    #[name = "changes_nav_label"]
+                                    gtk::Label {
+                                        set_ellipsize: relm4::gtk::pango::EllipsizeMode::Middle,
+                                        add_css_class: "caption",
+                                    },
+
+                                    #[name = "changes_nav_next"]
+                                    gtk::Button {
+                                        set_icon_name: "go-next-symbolic",
+                                        add_css_class: "flat",
+                                        add_css_class: "circular",
+                                        connect_clicked[sender] => move |_| {
+                                            sender.input(Msg::ChangesNavNext);
+                                        },
+                                    },
+                                },
                             },
                         },
                     },
                 },
                 },
             },
+        }
         }
     }
 
@@ -515,12 +688,19 @@ impl Component for App {
             revertible_card: None,
             pending_snapshot: None,
             message_snapshots: HashMap::new(),
+            session_base_snapshot: None,
+            changes_patch: String::new(),
+            changes_nav_index: 0,
+            changes_nav_files: Vec::new(),
+            wide_layout: false,
             partial: String::new(),
             show_reasoning: false,
             reasoning_card: None,
             reasoning_partial: String::new(),
             reasoning_cards: Vec::new(),
             reasoning_ms_queue: Vec::new(),
+            sessions_sidebar_collapsed: false,
+            command_palette_dialog: None,
             toast_timeout: None,
             busy: false,
         };
@@ -529,6 +709,19 @@ impl Component for App {
 
         // Enlaza los dos toggles como grupo radio (uno activo a la vez).
         widgets.agent_plan.set_group(Some(&widgets.agent_build));
+
+        {
+            let sender = sender.clone();
+            let last_width = Rc::new(Cell::new(0));
+            root.add_tick_callback(move |window, _| {
+                let width = window.allocated_width();
+                if last_width.get() != width {
+                    last_width.set(width);
+                    sender.input(Msg::WindowWidthChanged(width));
+                }
+                gtk::glib::ControlFlow::Continue
+            });
+        }
 
         // Atajo Shift+Tab en el campo de entrada para alternar Build/Plan. Se
         // registra como `ShortcutController` local al Entry: solo dispara con
@@ -545,6 +738,22 @@ impl Component for App {
             });
             controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
             widgets.entry.add_controller(controller);
+        }
+
+        // Paleta de comandos al estilo OpenCode. Se registra global a la ventana
+        // para que funcione aunque el foco esté dentro del campo de entrada.
+        {
+            let controller = gtk::ShortcutController::new();
+            controller.set_scope(gtk::ShortcutScope::Global);
+            let trigger =
+                gtk::ShortcutTrigger::parse_string("<Control>p").expect("trigger Ctrl+P válido");
+            let sender_action = sender.clone();
+            let action = gtk::CallbackAction::new(move |_, _| {
+                sender_action.input(Msg::OpenCommandPalette);
+                gtk::glib::Propagation::Stop
+            });
+            controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
+            root.add_controller(controller);
         }
 
         if !any_provider_key_present(&catalog) {
@@ -629,6 +838,7 @@ impl Component for App {
                     tracing::warn!("snapshots deshabilitados: el botón «Revertir» no aparecerá");
                 }
                 self.snapshots = Some(snap);
+                request_changes_patch(self, &sender);
             }
 
             Msg::SelectIndex(index) => {
@@ -657,6 +867,8 @@ impl Component for App {
                 self.revertible_card = None;
                 self.pending_snapshot = None;
                 self.message_snapshots.clear();
+                self.session_base_snapshot = None;
+                self.changes_patch.clear();
                 self.partial.clear();
                 clear_chat(&widgets.chat_list);
 
@@ -692,6 +904,13 @@ impl Component for App {
                 self.reasoning_card = None;
                 self.reasoning_partial.clear();
                 self.reasoning_ms_queue.clear();
+                self.session_base_snapshot = messages
+                    .iter()
+                    .find_map(|(id, _)| snapshots.get(id).cloned());
+                if self.session_base_snapshot.is_none() {
+                    self.changes_patch.clear();
+                    clear_chat(&widgets.changes_list);
+                }
                 let cards = render_history(
                     &widgets.chat_list,
                     &messages,
@@ -704,6 +923,7 @@ impl Component for App {
                 self.message_snapshots = snapshots;
                 self.session =
                     Session::from_messages(messages.into_iter().map(|(_, m)| m).collect());
+                request_changes_patch(self, &sender);
             }
 
             Msg::NewSession => {
@@ -724,6 +944,10 @@ impl Component for App {
                 });
             }
 
+            Msg::ToggleSessionsSidebar => {
+                self.sessions_sidebar_collapsed = !self.sessions_sidebar_collapsed;
+            }
+
             Msg::SessionCreated(meta) => {
                 let id = meta.id;
                 self.current_agent = meta.agent;
@@ -736,6 +960,9 @@ impl Component for App {
                 self.streaming_bubble = None;
                 self.tool_output = None;
                 self.partial.clear();
+                self.session_base_snapshot = None;
+                self.changes_patch.clear();
+                clear_chat(&widgets.changes_list);
                 clear_chat(&widgets.chat_list);
                 rebuild_session_list(&widgets.session_list, &self.sessions, 0, &sender);
             }
@@ -781,6 +1008,9 @@ impl Component for App {
                     self.revertible_card = None;
                     self.pending_snapshot = None;
                     self.message_snapshots.clear();
+                    self.session_base_snapshot = None;
+                    self.changes_patch.clear();
+                    clear_chat(&widgets.changes_list);
                     self.partial.clear();
                     clear_chat(&widgets.chat_list);
                 }
@@ -828,13 +1058,48 @@ impl Component for App {
             }
 
             Msg::OpenModelPicker => {
-                let options = catalog_model_options(self.engine.catalog());
+                let connected: HashSet<String> = self.engine.auth().all().into_keys().collect();
+                let options = catalog_model_options(self.engine.catalog(), &connected);
                 tracing::debug!(current = %self.current_model, count = options.len(), "modelo: abriendo selector");
                 let current = self.current_model.clone();
                 let sender_dialog = sender.clone();
                 show_model_picker_dialog(root, &current, &options, move |chosen| {
                     sender_dialog.input(Msg::ModelChanged(chosen));
                 });
+            }
+
+            Msg::OpenCommandPalette => {
+                if let Some(dialog) = self.command_palette_dialog.take() {
+                    dialog.close();
+                    return;
+                }
+                let sender_dialog = sender.clone();
+                let sender_closed = sender.clone();
+                let show_reasoning = self.show_reasoning;
+                let dialog = show_command_palette_dialog(
+                    root,
+                    show_reasoning,
+                    move |action| match action {
+                        CommandPaletteAction::SelectModel => {
+                            sender_dialog.input(Msg::OpenModelPicker)
+                        }
+                        CommandPaletteAction::ConnectProvider => {
+                            sender_dialog.input(Msg::OpenConnectProvider)
+                        }
+                        CommandPaletteAction::NewSession => sender_dialog.input(Msg::NewSession),
+                        CommandPaletteAction::ToggleThinking => {
+                            sender_dialog.input(Msg::ToggleReasoning(!show_reasoning))
+                        }
+                        CommandPaletteAction::Quit => sender_dialog.input(Msg::Quit),
+                    },
+                    move || sender_closed.input(Msg::CommandPaletteClosed),
+                );
+                self.command_palette_dialog = Some(dialog);
+            }
+
+            Msg::CommandPaletteClosed => {
+                self.command_palette_dialog = None;
+                widgets.entry.grab_focus();
             }
 
             Msg::ModelChanged(model) => {
@@ -884,13 +1149,14 @@ impl Component for App {
 
             Msg::OpenConnectProvider => {
                 let sender_dialog = sender.clone();
+                let connected: HashSet<String> = self.engine.auth().all().into_keys().collect();
                 let providers: Vec<(String, String)> = self
                     .engine
                     .catalog()
                     .providers()
                     .map(|p| (p.id.clone(), p.name.clone()))
                     .collect();
-                show_connect_provider_dialog(root, &providers, move |provider_id| {
+                show_connect_provider_dialog(root, &providers, &connected, move |provider_id| {
                     sender_dialog.input(Msg::ConnectProvider(provider_id));
                 });
             }
@@ -1229,6 +1495,9 @@ impl Component for App {
             }
 
             Msg::SnapshotPersisted { message_id, hash } => {
+                if self.session_base_snapshot.is_none() {
+                    self.session_base_snapshot = Some(hash.clone());
+                }
                 self.message_snapshots.insert(message_id, hash);
                 let card = self
                     .revertible_card
@@ -1250,6 +1519,44 @@ impl Component for App {
                         attach_revert_button(&widgets.chat_list, message_id, &sender);
                     }
                 }
+                request_changes_patch(self, &sender);
+            }
+
+            Msg::ChangesPatchLoaded(patch) => {
+                self.changes_patch = patch;
+                let files = parse_patch_files(&self.changes_patch);
+                self.changes_nav_files = files.iter().map(|f| f.path.clone()).collect();
+                self.changes_nav_index = 0;
+                render_changes_patch(&widgets.changes_list, &files);
+                let has_nav = self.changes_nav_files.len() > 1;
+                widgets.changes_nav_bar.set_visible(has_nav);
+                if has_nav {
+                    update_changes_nav_label(widgets, self);
+                }
+            }
+
+            Msg::ChangesNavPrev => {
+                if self.changes_nav_files.is_empty() || self.changes_nav_index == 0 {
+                    return;
+                }
+                self.changes_nav_index -= 1;
+                update_changes_nav_label(widgets, self);
+                scroll_to_changes_file(widgets, self.changes_nav_index);
+            }
+
+            Msg::ChangesNavNext => {
+                if self.changes_nav_files.is_empty()
+                    || self.changes_nav_index + 1 >= self.changes_nav_files.len()
+                {
+                    return;
+                }
+                self.changes_nav_index += 1;
+                update_changes_nav_label(widgets, self);
+                scroll_to_changes_file(widgets, self.changes_nav_index);
+            }
+
+            Msg::WindowWidthChanged(width) => {
+                self.wide_layout = width >= CHANGES_PANEL_BREAKPOINT;
             }
 
             Msg::Revert(message_id) => {
@@ -1337,6 +1644,14 @@ impl Component for App {
                     },
                 ));
             }
+
+            Msg::Quit => {
+                if let Some(app) = root.application() {
+                    app.quit();
+                } else {
+                    root.close();
+                }
+            }
         }
 
         update_controls(self, widgets);
@@ -1362,6 +1677,26 @@ async fn bootstrap(store: &Store, project_path: &str) -> zhi_core::Result<(i64, 
 /// puede abrirse aunque no haya clave de proveedor en el entorno (la falta se
 /// reporta al enviar; ver [ADR-0008]).
 fn update_controls(model: &App, widgets: &AppWidgets) {
+    widgets
+        .sessions_sidebar_expanded
+        .set_visible(!model.sessions_sidebar_collapsed);
+    widgets
+        .sessions_sidebar_collapsed
+        .set_visible(model.sessions_sidebar_collapsed);
+    widgets.sessions_sidebar.set_size_request(
+        if model.sessions_sidebar_collapsed {
+            48
+        } else {
+            -1
+        },
+        -1,
+    );
+
+    let show_changes = model.wide_layout && !model.changes_patch.trim().is_empty();
+    widgets.changes_separator.set_visible(show_changes);
+    widgets.changes_panel.set_visible(show_changes);
+    widgets.changes_panel.set_reveal_child(show_changes);
+
     let ready = model.current_session.is_some() && !model.busy;
     widgets.entry.set_sensitive(ready);
     widgets.send_button.set_sensitive(ready);
@@ -1405,6 +1740,254 @@ fn update_controls(model: &App, widgets: &AppWidgets) {
         widgets.reasoning_button.set_icon_name(icon);
         widgets.reasoning_button.set_tooltip_text(Some(tooltip));
     }
+}
+
+fn request_changes_patch(model: &App, sender: &ComponentSender<App>) {
+    let Some(snap) = model.snapshots.clone() else {
+        sender.input(Msg::ChangesPatchLoaded(String::new()));
+        return;
+    };
+    let hash = model.session_base_snapshot.clone();
+    let sender = sender.clone();
+    relm4::spawn(async move {
+        let patch = match hash {
+            Some(hash) => snap.patch(&hash).await,
+            None => snap.worktree_patch().await,
+        };
+        match patch {
+            Ok(patch) => sender.input(Msg::ChangesPatchLoaded(patch)),
+            Err(err) => sender.input(Msg::Failed(err.to_string())),
+        }
+    });
+}
+
+struct DiffFile {
+    path: String,
+    lines: Vec<DiffLine>,
+}
+
+struct DiffLine {
+    old: Option<usize>,
+    new: Option<usize>,
+    kind: DiffLineKind,
+    text: String,
+}
+
+enum DiffLineKind {
+    Context,
+    Addition,
+    Deletion,
+}
+
+fn render_changes_patch(container: &gtk::Box, files: &[DiffFile]) {
+    clear_chat(container);
+    for file in files {
+        container.append(&make_diff_file_section(file));
+    }
+}
+
+fn update_changes_nav_label(widgets: &AppWidgets, model: &App) {
+    let total = model.changes_nav_files.len();
+    if total == 0 {
+        return;
+    }
+    let path = &model.changes_nav_files[model.changes_nav_index];
+    let current = model.changes_nav_index + 1;
+    let markup = format!(
+        "<b>{}</b> ({}/{})",
+        relm4::gtk::glib::markup_escape_text(path),
+        current,
+        total
+    );
+    widgets.changes_nav_label.set_markup(&markup);
+    widgets
+        .changes_nav_prev
+        .set_sensitive(model.changes_nav_index > 0);
+    widgets
+        .changes_nav_next
+        .set_sensitive(model.changes_nav_index + 1 < total);
+}
+
+fn scroll_to_changes_file(widgets: &AppWidgets, index: usize) {
+    let mut child = widgets.changes_list.first_child();
+    for _ in 0..index {
+        child = child.and_then(|c| c.next_sibling());
+    }
+    let Some(target) = child else { return };
+    let Some((_, y)) = target.translate_coordinates(&widgets.changes_list, 0.0, 0.0) else {
+        return;
+    };
+    // Subir la cadena de padres hasta encontrar el ScrolledWindow.
+    let mut ancestor = widgets.changes_list.parent();
+    while let Some(ref widget) = ancestor {
+        if let Some(sw) = widget.downcast_ref::<gtk::ScrolledWindow>() {
+            sw.vadjustment().set_value(y.max(0.0));
+            return;
+        }
+        ancestor = widget.parent();
+    }
+}
+
+fn parse_patch_files(patch: &str) -> Vec<DiffFile> {
+    let mut files = Vec::new();
+    let mut current: Option<DiffFile> = None;
+    let mut old_line: Option<usize> = None;
+    let mut new_line: Option<usize> = None;
+
+    for line in patch.lines() {
+        if let Some(path) = line.strip_prefix("diff --git ").and_then(parse_diff_path) {
+            if let Some(file) = current.take().filter(|f| !f.lines.is_empty()) {
+                files.push(file);
+            }
+            current = Some(DiffFile {
+                path,
+                lines: Vec::new(),
+            });
+            old_line = None;
+            new_line = None;
+            continue;
+        }
+
+        if line.starts_with("@@") {
+            if let Some((old, new)) = parse_hunk_lines(line) {
+                old_line = Some(old);
+                new_line = Some(new);
+            }
+            continue;
+        }
+
+        if line.starts_with("+++")
+            || line.starts_with("---")
+            || line.starts_with("index ")
+            || line.starts_with("new file mode ")
+            || line.starts_with("deleted file mode ")
+        {
+            continue;
+        }
+
+        if let Some(text) = line.strip_prefix('+') {
+            let new = new_line.unwrap_or(0);
+            if let Some(file) = &mut current {
+                file.lines.push(DiffLine {
+                    old: None,
+                    new: Some(new),
+                    kind: DiffLineKind::Addition,
+                    text: text.to_string(),
+                });
+            }
+            new_line = new_line.map(|n| n + 1);
+            continue;
+        }
+
+        if let Some(text) = line.strip_prefix('-') {
+            let old = old_line.unwrap_or(0);
+            if let Some(file) = &mut current {
+                file.lines.push(DiffLine {
+                    old: Some(old),
+                    new: None,
+                    kind: DiffLineKind::Deletion,
+                    text: text.to_string(),
+                });
+            }
+            old_line = old_line.map(|n| n + 1);
+            continue;
+        }
+
+        if let Some(text) = line.strip_prefix(' ') {
+            let old = old_line.unwrap_or(0);
+            let new = new_line.unwrap_or(0);
+            if let Some(file) = &mut current {
+                file.lines.push(DiffLine {
+                    old: Some(old),
+                    new: Some(new),
+                    kind: DiffLineKind::Context,
+                    text: text.to_string(),
+                });
+            }
+            old_line = old_line.map(|n| n + 1);
+            new_line = new_line.map(|n| n + 1);
+        }
+    }
+
+    if let Some(file) = current.take().filter(|f| !f.lines.is_empty()) {
+        files.push(file);
+    }
+    files
+}
+
+fn parse_diff_path(line: &str) -> Option<String> {
+    line.split_whitespace()
+        .nth(1)
+        .map(|s| s.strip_prefix("b/").unwrap_or(s).to_string())
+}
+
+fn make_diff_file_section(file: &DiffFile) -> gtk::Widget {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    card.add_css_class("card");
+    card.set_hexpand(true);
+
+    let header = gtk::Label::new(Some(&file.path));
+    header.set_xalign(0.0);
+    header.set_selectable(true);
+    header.add_css_class("heading");
+    header.set_margin_top(8);
+    header.set_margin_bottom(8);
+    header.set_margin_start(10);
+    header.set_margin_end(10);
+    card.append(&header);
+
+    for line in &file.lines {
+        card.append(&make_diff_line(line));
+    }
+
+    card.upcast()
+}
+
+fn make_diff_line(line: &DiffLine) -> gtk::Widget {
+    let old = line
+        .old
+        .map(|n| format!("{n:>4}"))
+        .unwrap_or_else(|| "    ".to_string());
+    let new = line
+        .new
+        .map(|n| format!("{n:>4}"))
+        .unwrap_or_else(|| "    ".to_string());
+    let (mark, css_class) = match line.kind {
+        DiffLineKind::Context => (" ", None),
+        DiffLineKind::Addition => ("+", Some("diff-line-addition")),
+        DiffLineKind::Deletion => ("-", Some("diff-line-deletion")),
+    };
+    let text = relm4::gtk::glib::markup_escape_text(&line.text);
+
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.set_hexpand(true);
+    if let Some(css_class) = css_class {
+        row.add_css_class(css_class);
+    }
+
+    let label = gtk::Label::new(None);
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_wrap(false);
+    label.set_selectable(true);
+    label.add_css_class("monospace");
+    label.set_margin_start(8);
+    label.set_margin_end(8);
+    label.set_markup(&format!("{old} {new} {mark} {text}"));
+    row.append(&label);
+    row.upcast()
+}
+
+fn parse_hunk_lines(line: &str) -> Option<(usize, usize)> {
+    let mut parts = line.split_whitespace();
+    parts.next()?;
+    let old = parse_hunk_start(parts.next()?)?;
+    let new = parse_hunk_start(parts.next()?)?;
+    Some((old, new))
+}
+
+fn parse_hunk_start(part: &str) -> Option<usize> {
+    part.get(1..)?.split(',').next()?.parse().ok()
 }
 
 /// Resumen corto para el título de una sesión a partir de su primer mensaje.
@@ -1731,6 +2314,9 @@ fn fill_with_blocks(body: &gtk::Box, markdown: &str, sender: &ComponentSender<Ap
             markdown::Block::Code { lang, text } => {
                 body.append(&make_code_block(lang.as_deref(), &text, sender));
             }
+            markdown::Block::Table { headers, rows } => {
+                body.append(&make_table_block(&headers, &rows));
+            }
         }
     }
 }
@@ -1791,6 +2377,51 @@ fn make_code_block(lang: Option<&str>, text: &str, sender: &ComponentSender<App>
 
     stack.append(&overlay);
     frame.set_child(Some(&stack));
+    frame.upcast()
+}
+
+/// Tabla renderizada como `gtk::Grid` con cabeceras en negrita y bordes sutiles.
+fn make_table_block(headers: &[String], rows: &[Vec<String>]) -> gtk::Widget {
+    let frame = gtk::Frame::new(None);
+    frame.add_css_class("card");
+    frame.set_margin_top(8);
+    frame.set_margin_bottom(8);
+    frame.set_hexpand(true);
+
+    let grid = gtk::Grid::new();
+    grid.set_column_spacing(12);
+    grid.set_row_spacing(4);
+    grid.set_margin_top(8);
+    grid.set_margin_bottom(8);
+    grid.set_margin_start(12);
+    grid.set_margin_end(12);
+
+    for (col, header) in headers.iter().enumerate() {
+        let label = gtk::Label::new(Some(header));
+        label.set_xalign(0.0);
+        label.set_selectable(true);
+        label.set_halign(gtk::Align::Start);
+        label.add_css_class("heading");
+        grid.attach(&label, col as i32, 0, 1, 1);
+    }
+
+    for (row_idx, row) in rows.iter().enumerate() {
+        for (col_idx, cell) in row.iter().enumerate() {
+            let label = gtk::Label::new(Some(cell));
+            label.set_xalign(0.0);
+            label.set_selectable(true);
+            label.set_halign(gtk::Align::Start);
+            grid.attach(&label, col_idx as i32, (row_idx + 1) as i32, 1, 1);
+        }
+    }
+
+    let scroll = gtk::ScrolledWindow::new();
+    scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
+    scroll.set_min_content_width(0);
+    scroll.set_propagate_natural_width(false);
+    scroll.set_child(Some(&grid));
+
+    frame.set_child(Some(&scroll));
     frame.upcast()
 }
 
@@ -1956,6 +2587,188 @@ fn show_revert_dialog(
     dialog.present();
 }
 
+fn show_command_palette_dialog(
+    parent: &adw::ApplicationWindow,
+    show_reasoning: bool,
+    on_select: impl Fn(CommandPaletteAction) + 'static,
+    on_close: impl Fn() + 'static,
+) -> adw::MessageDialog {
+    let dialog = adw::MessageDialog::new(Some(parent), Some("Comandos"), None);
+    dialog.add_response("cancel", "Cancelar");
+    dialog.add_response("apply", "Abrir");
+    dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("apply"));
+    dialog.set_close_response("cancel");
+
+    {
+        let controller = gtk::ShortcutController::new();
+        for shortcut in ["Escape", "<Control>p"] {
+            let trigger = gtk::ShortcutTrigger::parse_string(shortcut).expect("trigger válido");
+            let dialog_for_shortcut = dialog.clone();
+            let action = gtk::CallbackAction::new(move |_, _| {
+                dialog_for_shortcut.response("cancel");
+                gtk::glib::Propagation::Stop
+            });
+            controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
+        }
+        dialog.add_controller(controller);
+    }
+
+    let container = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    container.set_size_request(420, -1);
+    container.set_margin_top(4);
+
+    let search = gtk::SearchEntry::new();
+    search.set_placeholder_text(Some("Buscar comando…"));
+    container.append(&search);
+
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::Single);
+    list.add_css_class("boxed-list");
+
+    let thinking_label = if show_reasoning {
+        "Ocultar Thinking"
+    } else {
+        "Mostrar Thinking"
+    };
+
+    let commands: Rc<Vec<(CommandPaletteAction, &str, &str)>> = Rc::new(vec![
+        (
+            CommandPaletteAction::SelectModel,
+            "Seleccionar Modelo",
+            "Cambiar el modelo activo",
+        ),
+        (
+            CommandPaletteAction::ConnectProvider,
+            "Conectar Proveedor",
+            "Agregar una cuenta o API key",
+        ),
+        (
+            CommandPaletteAction::NewSession,
+            "Nueva Sesión",
+            "Crear una conversación nueva",
+        ),
+        (
+            CommandPaletteAction::ToggleThinking,
+            thinking_label,
+            "Alternar visibilidad del razonamiento",
+        ),
+        (CommandPaletteAction::Quit, "Salir", "Cerrar xiě-code"),
+    ]);
+
+    for (idx, (_, title, description)) in commands.iter().enumerate() {
+        let row = gtk::ListBoxRow::new();
+        let row_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        row_box.set_margin_top(8);
+        row_box.set_margin_bottom(8);
+        row_box.set_margin_start(12);
+        row_box.set_margin_end(12);
+
+        let title_label = gtk::Label::new(Some(title));
+        title_label.set_xalign(0.0);
+        title_label.add_css_class("heading");
+        row_box.append(&title_label);
+
+        let description_label = gtk::Label::new(Some(description));
+        description_label.set_xalign(0.0);
+        description_label.add_css_class("dim-label");
+        row_box.append(&description_label);
+
+        row.set_child(Some(&row_box));
+        unsafe {
+            row.set_data::<usize>("idx", idx);
+            row.set_data::<Rc<String>>(
+                "needle",
+                Rc::new(format!("{title} {description}").to_lowercase()),
+            );
+        }
+        list.append(&row);
+    }
+
+    if let Some(first) = list.row_at_index(0) {
+        list.select_row(Some(&first));
+    }
+
+    let commands_len = commands.len();
+    {
+        let search_for_filter = search.clone();
+        list.set_filter_func(move |row| {
+            let needle = search_for_filter.text().to_string();
+            if needle.is_empty() {
+                return true;
+            }
+            let needle = needle.to_lowercase();
+            unsafe { row.data::<Rc<String>>("needle") }
+                .map(|ptr| {
+                    let s = unsafe { ptr.as_ref() };
+                    s.contains(&needle)
+                })
+                .unwrap_or(true)
+        });
+        let list_for_search = list.clone();
+        search.connect_search_changed(move |search| {
+            list_for_search.invalidate_filter();
+            let needle = search.text().to_string().to_lowercase();
+            for idx in 0..commands_len {
+                let Some(row) = list_for_search.row_at_index(idx as i32) else {
+                    continue;
+                };
+                let matches = unsafe { row.data::<Rc<String>>("needle") }
+                    .map(|ptr| {
+                        let stored = unsafe { ptr.as_ref() };
+                        needle.is_empty() || stored.contains(&needle)
+                    })
+                    .unwrap_or(false);
+                if matches {
+                    list_for_search.select_row(Some(&row));
+                    return;
+                }
+            }
+            list_for_search.unselect_all();
+        });
+    }
+
+    {
+        let dialog_for_activate = dialog.clone();
+        list.connect_row_activated(move |list, row| {
+            list.select_row(Some(row));
+            dialog_for_activate.response("apply");
+        });
+    }
+
+    {
+        let dialog_for_search = dialog.clone();
+        search.connect_activate(move |_| {
+            dialog_for_search.response("apply");
+        });
+    }
+
+    container.append(&list);
+    dialog.set_extra_child(Some(&container));
+
+    let list_for_response = list.clone();
+    dialog.connect_response(None, move |dialog, response| {
+        on_close();
+        dialog.close();
+        if response != "apply" {
+            return;
+        }
+        let Some(row) = list_for_response.selected_row() else {
+            return;
+        };
+        let Some(ptr) = (unsafe { row.data::<usize>("idx") }) else {
+            return;
+        };
+        if let Some((action, _, _)) = commands.get(unsafe { *ptr.as_ref() }) {
+            on_select(*action);
+        }
+    });
+
+    dialog.present();
+    search.grab_focus();
+    dialog
+}
+
 /// Una opción del picker de modelos: `value` es el `provider/model` que se
 /// persiste y se envía al motor; `label` es la cadena visible.
 struct ModelOption {
@@ -1963,13 +2776,12 @@ struct ModelOption {
     label: String,
 }
 
-/// Construye la lista de modelos del catálogo agrupados por proveedor,
-/// filtrando los marcados como `deprecated`. No distingue por presencia de
-/// API key: el patrón de OpenCode muestra el universo entero; la falta de
-/// clave se reporta solo si el usuario intenta enviar con ese modelo.
-fn catalog_model_options(catalog: &Catalog) -> Vec<ModelOption> {
+/// Construye la lista de modelos de proveedores conectados, excluyendo los
+/// marcados como `deprecated`.
+fn catalog_model_options(catalog: &Catalog, connected: &HashSet<String>) -> Vec<ModelOption> {
     catalog
         .providers()
+        .filter(|p| connected.contains(&p.id))
         .flat_map(|p| {
             p.models
                 .values()
@@ -2054,6 +2866,7 @@ fn show_model_picker_dialog(
     dialog.set_extra_child(Some(&container));
 
     let values: Rc<Vec<String>> = Rc::new(options.iter().map(|o| o.value.clone()).collect());
+    let options_len = options.len();
     let current_idx = options.iter().position(|o| o.value == current);
 
     for (idx, option) in options.iter().enumerate() {
@@ -2076,16 +2889,10 @@ fn show_model_picker_dialog(
         list.append(&row);
     }
 
-    // Seleccionar y enfocar el modelo activo al abrir, para que el usuario
-    // vea de inmediato dónde está. El scroll a esa fila se hace tras el
-    // present con `idle_add_local_once`.
-    if let Some(idx) = current_idx {
+    // Seleccionar el modelo activo al abrir, manteniendo el foco en el buscador.
+    if let Some(idx) = current_idx.or((!options.is_empty()).then_some(0)) {
         if let Some(row) = list.row_at_index(idx as i32) {
             list.select_row(Some(&row));
-            let row_clone = row.clone();
-            gtk::glib::idle_add_local_once(move || {
-                row_clone.grab_focus();
-            });
         }
     }
 
@@ -2107,8 +2914,17 @@ fn show_model_picker_dialog(
                 .unwrap_or(true)
         });
         let list_for_search = list.clone();
-        search.connect_search_changed(move |_| {
+        search.connect_search_changed(move |search| {
             list_for_search.invalidate_filter();
+            if let Some(row) = first_matching_model_row(
+                &list_for_search,
+                &search.text().to_string().to_lowercase(),
+                options_len,
+            ) {
+                list_for_search.select_row(Some(&row));
+            } else {
+                list_for_search.unselect_all();
+            }
         });
     }
 
@@ -2122,13 +2938,26 @@ fn show_model_picker_dialog(
         });
     }
 
+    {
+        let dialog_for_search = dialog.clone();
+        search.connect_activate(move |_| {
+            dialog_for_search.response("apply");
+        });
+    }
+
     // Botón "Aplicar": aplica la fila seleccionada actualmente.
     let list_for_response = list.clone();
-    dialog.connect_response(None, move |_, response| {
+    let search_for_response = search.clone();
+    dialog.connect_response(None, move |dialog, response| {
         if response != "apply" {
             return;
         }
-        let Some(row) = list_for_response.selected_row() else {
+        let needle = search_for_response.text().to_string().to_lowercase();
+        let row = list_for_response
+            .selected_row()
+            .filter(|row| model_row_matches(row, &needle))
+            .or_else(|| first_matching_model_row(&list_for_response, &needle, options_len));
+        let Some(row) = row else {
             return;
         };
         let Some(ptr) = (unsafe { row.data::<usize>("idx") }) else {
@@ -2137,10 +2966,37 @@ fn show_model_picker_dialog(
         let idx = unsafe { *ptr.as_ref() };
         if let Some(chosen) = values.get(idx) {
             on_select(chosen.clone());
+            dialog.close();
         }
     });
 
     dialog.present();
+    gtk::glib::idle_add_local_once(move || {
+        search.grab_focus();
+    });
+}
+
+fn first_matching_model_row(
+    list: &gtk::ListBox,
+    needle: &str,
+    options_len: usize,
+) -> Option<gtk::ListBoxRow> {
+    (0..options_len).find_map(|idx| {
+        let row = list.row_at_index(idx as i32)?;
+        model_row_matches(&row, needle).then_some(row)
+    })
+}
+
+fn model_row_matches(row: &gtk::ListBoxRow, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    unsafe { row.data::<Rc<String>>("needle") }
+        .map(|ptr| {
+            let stored = unsafe { ptr.as_ref() };
+            stored.contains(needle)
+        })
+        .unwrap_or(false)
 }
 
 /// Acción que el modal de Configuración devuelve al callback.
@@ -2238,6 +3094,7 @@ fn show_settings_dialog(
 fn show_connect_provider_dialog(
     parent: &adw::ApplicationWindow,
     providers: &[(String, String)],
+    connected_ids: &HashSet<String>,
     on_select: impl Fn(String) + 'static,
 ) {
     let dialog = adw::MessageDialog::new(Some(parent), Some("Conectar proveedor"), None);
@@ -2270,18 +3127,27 @@ fn show_connect_provider_dialog(
     let mut sorted: Vec<&(String, String)> = providers.iter().collect();
     sorted.sort_by_key(|(id, _)| if id == "openai" { 0 } else { 1 });
 
+    let connected_ids: Rc<HashSet<String>> = Rc::new(connected_ids.iter().cloned().collect());
     let values: Rc<Vec<String>> = Rc::new(sorted.iter().map(|(id, _)| id.clone()).collect());
     for (idx, (id, name)) in sorted.iter().enumerate() {
+        let is_connected = connected_ids.contains(id.as_str());
         let row = gtk::ListBoxRow::new();
-        let hbox = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        row.set_selectable(!is_connected);
+        row.set_activatable(!is_connected);
+        row.set_sensitive(!is_connected);
+
+        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         hbox.set_margin_top(8);
         hbox.set_margin_bottom(8);
         hbox.set_margin_start(12);
         hbox.set_margin_end(12);
+
+        let text_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        text_box.set_hexpand(true);
         let title = gtk::Label::new(Some(name));
         title.set_xalign(0.0);
         title.add_css_class("heading");
-        hbox.append(&title);
+        text_box.append(&title);
         let subtitle = gtk::Label::new(Some(if id == "openai" {
             "OAuth (cuenta ChatGPT Pro/Plus)"
         } else {
@@ -2289,7 +3155,16 @@ fn show_connect_provider_dialog(
         }));
         subtitle.set_xalign(0.0);
         subtitle.add_css_class("dim-label");
-        hbox.append(&subtitle);
+        text_box.append(&subtitle);
+        hbox.append(&text_box);
+
+        if is_connected {
+            let check = gtk::Image::from_icon_name("object-select-symbolic");
+            check.add_css_class("success");
+            check.set_tooltip_text(Some("Proveedor conectado"));
+            hbox.append(&check);
+        }
+
         row.set_child(Some(&hbox));
         let needle: Rc<String> = Rc::new(format!("{} {}", id, name).to_lowercase());
         unsafe {
@@ -2298,8 +3173,13 @@ fn show_connect_provider_dialog(
         }
         list.append(&row);
     }
-    if let Some(first) = list.row_at_index(0) {
-        list.select_row(Some(&first));
+    if let Some(idx) = sorted
+        .iter()
+        .position(|(id, _)| !connected_ids.contains(id.as_str()))
+    {
+        if let Some(row) = list.row_at_index(idx as i32) {
+            list.select_row(Some(&row));
+        }
     }
 
     {
@@ -2329,13 +3209,26 @@ fn show_connect_provider_dialog(
 
     {
         let dialog_for_activate = dialog.clone();
+        let connected_for_activate = connected_ids.clone();
+        let values_for_activate = values.clone();
         list.connect_row_activated(move |list, row| {
+            let Some(ptr) = (unsafe { row.data::<usize>("idx") }) else {
+                return;
+            };
+            let idx = unsafe { *ptr.as_ref() };
+            if values_for_activate
+                .get(idx)
+                .is_some_and(|id| connected_for_activate.contains(id))
+            {
+                return;
+            }
             list.select_row(Some(row));
             dialog_for_activate.response("apply");
         });
     }
 
     let list_for_response = list.clone();
+    let connected_for_response = connected_ids.clone();
     dialog.connect_response(None, move |_, response| {
         if response != "apply" {
             return;
@@ -2348,6 +3241,9 @@ fn show_connect_provider_dialog(
         };
         let idx = unsafe { *ptr.as_ref() };
         if let Some(id) = values.get(idx) {
+            if connected_for_response.contains(id) {
+                return;
+            }
             on_select(id.clone());
         }
     });
@@ -2553,6 +3449,30 @@ const APP_CSS: &str = "
         background-image: none;
         background-color: #daa520;
         color: white;
+    }
+    .diff-line-addition {
+        background-color: #143d2a;
+    }
+    .diff-line-deletion {
+        background-color: #4a1f24;
+    }
+    .permission-status {
+        border-radius: 999px;
+        padding: 2px 8px;
+        color: white;
+        font-weight: 700;
+    }
+    .permission-approved {
+        background-color: #2e7d32;
+    }
+    .permission-rejected {
+        background-color: #b3261e;
+    }
+    .changes-nav-bar {
+        background-color: alpha(@window_bg_color, 0.85);
+        border-radius: 12px;
+        padding: 2px 4px;
+        border: 1px solid alpha(@borders, 0.5);
     }
 ";
 

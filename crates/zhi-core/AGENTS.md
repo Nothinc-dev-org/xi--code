@@ -5,10 +5,10 @@
 > `store` —persistencia SQLite— (Fase 2), el bucle de agente
 > (`Engine::run_turn` → `AgentEvent`) con tools y permisos
 > (`PermissionResolver`) (Fase 3a/3b), el módulo `snapshot` —repo git aislado
-> con `track`/`patch_files`/`restore`— integrado al bucle como un snapshot por
-> turno (Fase 3c), y el perfil `AgentKind` (`Build`/`Plan`) que controla el
-> system prompt y filtra las tools ofrecidas al modelo (Fase 4). Persistido por
-> sesión en la columna `agent` de `sessions`. Ver
+> con `track`/`patch`/`worktree_patch`/`patch_files`/`restore`— integrado al
+> bucle como un snapshot por turno (Fase 3c), y el perfil `AgentKind`
+> (`Build`/`Plan`) que controla el system prompt y filtra las tools ofrecidas
+> al modelo (Fase 4). Persistido por sesión en la columna `agent` de `sessions`. Ver
 > [ADR-0007](../../docs/decisions/0007-tools-permisos-bucle-agente.md).
 > **Engine multi-proveedor**: `new(Arc<Catalog>, AuthStore)` infalible; mapa
 > perezoso `HashMap<provider_id, Arc<dyn Provider>>` que se resuelve por
@@ -40,7 +40,10 @@ Incluye:
 - **Config**: carga proveedores, agentes, claves, servidores MCP.
 - **Permisos**: modela qué acciones requieren autorización; delega la resolución
   en la UI.
-- **Snapshots**: checkpoints del worktree para revertir.
+- **Snapshots**: checkpoints del worktree para revertir. Métodos `patch(hash)`
+  (diff unificado del worktree actual respecto a un snapshot) y
+  `worktree_patch()` (diff del worktree real del repositorio Git, fallback
+  para sesiones sin snapshot asociado).
 - **Persistencia** (módulo `store`): SQLite vía `sqlx`. Proyectos, sesiones y
   mensajes. Esquema con `CREATE TABLE IF NOT EXISTS`, consultas verificadas en
   runtime y conexión perezosa. Ver [ADR-0006](../../docs/decisions/0006-persistencia-sqlite.md).

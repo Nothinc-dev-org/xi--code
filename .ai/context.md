@@ -51,7 +51,7 @@ lo que ya está en `docs/`; esto son punteros y estado.
   Markdown. Puente Tokio↔GLib vía `relm4::spawn` + `sender.input`.
 - **Fase 2 (persistencia y sesiones)** completa: módulo `zhi-core::store`
   (SQLite/`sqlx`) con proyectos/sesiones/mensajes; `zhi-gtk` con sidebar de
-  sesiones, sesión nueva y reanudación de existentes. Todo persistido.
+  sesiones (colapsable), sesión nueva y reanudación de existentes. Todo persistido.
 - **Fase 3 (tools y permisos)** completa: `zhi-tool`
   (read/write/edit/list/glob/grep/bash, confinadas al worktree), bucle de
   agente `Engine::run_turn`→`AgentEvent`, function calling en `zhi-provider`,
@@ -63,8 +63,14 @@ lo que ya está en `docs/`; esto son punteros y estado.
   botón "Revertir" en la última tarjeta del paso con `adw::MessageDialog` que
   lista los archivos afectados. `fmt`/`clippy -D warnings`/`test`/build del
   workspace en verde.
+- **Fase 4 (agentes y multi-proveedor)** en progreso: `AgentKind` (Build/Plan)
+  persistido; catálogo dinámico `models.dev`; selector de modelo (filtra solo
+  proveedores conectados); auth/OAuth proveedores; razonamiento en streaming.
+  Paleta de comandos (Ctrl+P), panel de cambios (diff unificado del worktree),
+  sidebar de sesiones colapsable, render de tablas Markdown, layout responsive
+  (breakpoint 1180px).
 - Arranque: `DEEPSEEK_API_KEY=... cargo run -p zhi-gtk`.
-- Próximo hito: **Fase 4 — agentes y multi-proveedor**. Ver
+- Próximo hito: **Fase 4** (completar) y **Fase 5 — MCP y LSP**. Ver
   [`docs/roadmap.md`](../docs/roadmap.md).
 
 ### Notas de implementación
@@ -112,6 +118,29 @@ lo que ya está en `docs/`; esto son punteros y estado.
   Tokio↔GLib que el streaming. El sidebar es un `gtk::ListBox`; la fila→sesión se
   mapea por índice (`row.index()`), y la selección programática se neutraliza
   comparando con `current_session` para no recargar en bucle.
+- **Sidebar colapsable**: dos `gtk::Box`互斥 (`sessions_sidebar_collapsed` /
+  `sessions_sidebar_expanded`) con toggle por `Msg::ToggleSessionsSidebar`. El
+  sidebar colapsado muestra solo un botón de toggle con icono; el expandido
+  incluye header bar con botón "Nueva sesión" y botón de colapsar.
+- **Panel de cambios**: `gtk::Revealer` a la derecha del chat, visible solo si
+  `wide_layout` (ventana ≥ 1180px) y hay diff. Usa `Snapshots::patch()` (diff
+  contra snapshot base de la sesión) o `Snapshots::worktree_patch()` (diff del
+  worktree real, fallback). Navegación entre archivos con barra flotante sobre
+  el `ScrolledWindow`. Render del diff como tarjetas por archivo con líneas
+  coloreadas (`.diff-line-addition` / `.diff-line-deletion`).
+- **Paleta de comandos** (Ctrl+P): `adw::MessageDialog` con `gtk::SearchEntry`
+  y `gtk::ListBox` filtrable. Acciones: Seleccionar Modelo, Conectar Proveedor,
+  Nueva Sesión, Mostrar/Ocultar Thinking, Salir. Cierre con Escape o Ctrl+P.
+- **Layout responsive**: `add_tick_callback` en la ventana detecta cambios de
+  ancho; si `width >= CHANGES_PANEL_BREAKPOINT` (1180px) se muestra el panel
+  de cambios junto al chat.
+- **Render de tablas**: `markdown::Block::Table { headers, rows }` parseado con
+  `pulldown_cmark::Options::ENABLE_TABLES`. Se materializa como `gtk::Grid`
+  dentro de un `gtk::Frame` con cabeceras en negrita y scroll horizontal.
+- **Selector de modelo filtrado**: `catalog_model_options` recibe
+  `connected: &HashSet<String>` y solo muestra modelos de proveedores ya
+  conectados. El diálogo de "Conectar proveedor" marca con check los
+  proveedores ya conectados y los deshabilita.
 
 ## Cómo proponer cambios estructurales
 

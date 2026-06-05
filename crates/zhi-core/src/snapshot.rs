@@ -100,6 +100,36 @@ impl Snapshots {
             .collect())
     }
 
+    /// Diff unificado del worktree actual respecto al snapshot `hash`.
+    pub async fn patch(&self, hash: &str) -> Result<String> {
+        if !self.available {
+            return Ok(String::new());
+        }
+        self.stage().await?;
+        self.run(&["diff", "--cached", "--unified=3", hash]).await
+    }
+
+    /// Diff del repositorio Git real del worktree. Es un fallback de UI para
+    /// sesiones sin snapshot asociado todavía.
+    pub async fn worktree_patch(&self) -> Result<String> {
+        if !self.available {
+            return Ok(String::new());
+        }
+        let output = Command::new("git")
+            .args(["diff", "--no-ext-diff", "--unified=3"])
+            .current_dir(&self.workdir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| Error::Snapshot(format!("no se pudo ejecutar git: {e}")))?;
+        if !output.status.success() {
+            return Ok(String::new());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     /// `git add --all` **sin pathspec explícito**: recorre el worktree
     /// respetando el `.gitignore` del usuario y se salta los archivos ignorados
     /// silenciosamente (con pathspec explícito como `.`, git falla en lugar de

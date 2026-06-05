@@ -41,7 +41,7 @@ fases incrementales; cada fase deja la app utilizable.
 > y build del binario en verde. DB en `$XDG_DATA_HOME/xiě-code/xiě-code.db`.
 > Pendiente de validación visual en sesión gráfica del usuario.
 
-## Fase 3 — Tools y permisos 🚧
+## Fase 3 — Tools y permisos ✅
 
 Ver [ADR-0007](decisions/0007-tools-permisos-bucle-agente.md).
 
@@ -92,8 +92,8 @@ Ver [ADR-0007](decisions/0007-tools-permisos-bucle-agente.md).
       relativo al catálogo).
 - [x] Selector de modelo en la UI (`OpenModelPicker`/`ModelChanged`), modelo
       por turno en `Engine::run_turn` y `Provider::stream_chat`, persistido por
-      sesión como `provider/model`. El picker muestra todos los modelos del
-      catálogo filtrado, sin distinguir por API key (patrón OpenCode); filtra
+      sesión como `provider/model`. El picker muestra solo modelos de proveedores
+      ya conectados (filtra por `HashSet<String>` de `AuthStore`); filtra
       `status: "deprecated"`. `is_reasoning_model` se lee del catálogo
       (campo `reasoning` por modelo), no de una whitelist en código.
 - [x] **Settings + Connect (auth de proveedores)** estilo OpenCode. Botón
@@ -102,6 +102,7 @@ Ver [ADR-0007](decisions/0007-tools-permisos-bucle-agente.md).
       contra `auth.openai.com` para OpenAI (servidor local en `127.0.0.1:1455`,
       tokens persistidos en `$XDG_DATA_HOME/xiě-code/auth.json` con permisos
       0600). Para el resto de proveedores: entrada manual de API key.
+      Proveedores ya conectados se marcan con check y se deshabilitan.
       Ver [ADR-0010](decisions/0010-auth-oauth-openai.md). **Follow-up
       explícito:** el cliente Codex Responses API (consumo del `access_token`
       en inferencia) queda pendiente; los tokens se guardan, pero usar la
@@ -121,6 +122,11 @@ Ver [ADR-0007](decisions/0007-tools-permisos-bucle-agente.md).
 
 - [ ] Adjuntos (imágenes, archivos) en mensajes.
 - [ ] Atajos de teclado, temas, accesibilidad.
+- [x] Sidebar de sesiones colapsable (toggle con íconos Adwaita).
+- [x] Paleta de comandos (Ctrl+P) con búsqueda y acciones rápidas.
+- [x] Panel de cambios (diff unificado del worktree) con navegación entre archivos.
+- [x] Render de tablas Markdown como widgets `gtk::Grid` nativos.
+- [x] Layout responsive: panel de cambios visible solo si la ventana ≥ 1180px.
 - [ ] Migrar el layout sidebar+conversación a `adw::NavigationSplitView`
       (requiere el feature `v1_4` de libadwaita): una sola tira de controles de
       ventana y colapso responsive del sidebar en ventanas estrechas. Hoy se usan

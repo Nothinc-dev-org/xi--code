@@ -1,8 +1,9 @@
 # AGENTS.md — zhi-gtk
 
 > Implementado: vista de chat con streaming (Fase 1), sidebar de sesiones
-> persistidas (Fase 2) y render de tools + permisos embebidos (Fase 3). Lee
-> `/AGENTS.md`, `docs/architecture.md` y
+> persistidas y colapsable (Fase 2), render de tools + permisos embebidos (Fase 3),
+> panel de cambios con diff (Fase 4), paleta de comandos (Ctrl+P), render de
+> tablas Markdown y layout responsive. Lee `/AGENTS.md`, `docs/architecture.md` y
 > `docs/decisions/0002-gtk4-libadwaita-relm4.md` antes de tocar este crate.
 
 ## Responsabilidad
@@ -10,10 +11,14 @@
 La **app de escritorio**: UI con GTK4 + libadwaita + Relm4. Es el binario del
 proyecto. **Solo presentación e interacción**; no contiene lógica de negocio.
 
-- Ventana principal (libadwaita), lista de sesiones, vista de chat, render de
-  markdown del stream, composición de mensajes y adjuntos.
+- Ventana principal (libadwaita), sidebar de sesiones (colapsable), vista de
+  chat, panel de cambios con diff unificado, render de markdown del stream
+  (prosa + bloques de código + tablas), composición de mensajes y adjuntos.
+- Paleta de comandos (Ctrl+P) con búsqueda y acciones.
 - Diálogos de resolución de permisos (preguntar/permitir/denegar).
-- Selección de proyecto/worktree, agente y modelo.
+- Selección de proyecto/worktree, agente y modelo (filtrado por proveedores
+  conectados).
+- Layout responsive: panel de cambios visible solo si la ventana ≥ 1180px.
 
 ## Depende de
 
@@ -59,6 +64,52 @@ Un único `gtk::Revealer` montado como `add_overlay` del `gtk::Overlay` raíz,
 con `halign=Center, valign=Start`. Se dispara con `Msg::Toast(text)` y se
 auto-oculta tras un timeout corto; un toast nuevo cancela el timeout previo.
 Hoy lo usa el botón de copiar de los bloques de código ("Texto Copiado").
+
+## Sidebar de sesiones colapsable
+
+Dos `gtk::Box`互斥: `sessions_sidebar_collapsed` (solo botón de toggle con
+icono `sidebar-show-symbolic`) y `sessions_sidebar_expanded` (header bar con
+título "Sesiones", botón "Nueva sesión" y botón de colapsar). Toggle por
+`Msg::ToggleSessionsSidebar`. El estado `sessions_sidebar_collapsed` se
+persiste en memoria (no en DB). El sidebar colapsado tiene `size_request`
+de 48px; el expandido usa el ancho por defecto.
+
+## Panel de cambios
+
+`gtk::Revealer` con transición `SlideLeft` situado a la derecha del chat.
+Visible solo si `wide_layout` (ventana ≥ `CHANGES_PANEL_BREAKPOINT` = 1180px)
+y hay contenido en `changes_patch`. El diff se obtiene de forma asíncrona
+(`request_changes_patch`): si la sesión tiene `session_base_snapshot`, usa
+`Snapshots::patch(hash)`; si no, usa `Snapshots::worktree_patch()` como
+fallback. El diff se parsea en `parse_patch_files` (retorna `Vec<DiffFile>`
+con `DiffLine` por cada línea) y se renderiza como tarjetas por archivo con
+líneas coloreadas (`.diff-line-addition` / `.diff-line-deletion`). Barra de
+navegación flotante (`changes_nav_bar`) con botones prev/next y label con
+ruta del archivo actual y conteo.
+
+## Paleta de comandos
+
+`adw::MessageDialog` con `gtk::SearchEntry` y `gtk::ListBox` filtrable.
+Se abre con Ctrl+P (ShortcutController global en la ventana). Acciones
+disponibles (`CommandPaletteAction`): SelectModel, ConnectProvider,
+NewSession, ToggleThinking, Quit. Cierre con Escape o Ctrl+P. El foco
+se devuelve al `entry` al cerrar.
+
+## Render de tablas
+
+`markdown::Block::Table { headers, rows }` parseado con
+`pulldown_cmark::Options::ENABLE_TABLES`. Se materializa como `gtk::Grid`
+dentro de un `gtk::Frame` con cabeceras en negrita (`.heading`) y scroll
+horizontal (`gtk::PolicyType::Automatic`). Las celdas son `gtk::Label`
+seleccionable con `xalign=0.0`.
+
+## Layout responsive
+
+`add_tick_callback` en la ventana detecta cambios de ancho y emite
+`Msg::WindowWidthChanged(width)`. Si `width >= CHANGES_PANEL_BREAKPOINT`
+(1180px), `wide_layout = true` y se muestra el panel de cambios junto al
+chat. El panel tiene `size_request` de `CHANGES_PANEL_WIDTH` (420px). Si
+la ventana es estrecha, el panel se oculta y el chat usa todo el ancho.
 
 ## Invariantes
 
